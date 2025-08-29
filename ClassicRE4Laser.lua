@@ -2,7 +2,6 @@ if reframework:get_game_name() ~= "re4" then
   return
 end
 
-local statics = require("utility/Statics")
 local re4 = require("utility/RE4")
 local hk = require("Hotkeys/Hotkeys")
 local laser_toggle_action = "ToggleLaserTrail"
@@ -34,13 +33,13 @@ re4.crosshair_pos = Vector3f.new(0, 0, 0)
 re4.crosshair_normal = Vector3f.new(0, 0, 0)
 
 local gameobject_get_transform = sdk.find_type_definition("via.GameObject"):get_method("get_Transform")
-local cast_ray_async_method = sdk.find_type_definition("via.physics.System"):get_method("castRayAsync(via.physics.CastRayQuery, via.physics.CastRayResult)")
 
 local joint_get_position = sdk.find_type_definition("via.Joint"):get_method("get_Position")
 local joint_get_rotation = sdk.find_type_definition("via.Joint"):get_method("get_Rotation")
 
-local CollisionLayer = statics.generate(sdk.game_namespace("CollisionUtil.Layer"))
-local CollisionFilter = statics.generate(sdk.game_namespace("CollisionUtil.Filter"))
+local CastRays = require("utility/CastRays")
+local CollisionLayer = CastRays.CollisionLayer
+local CollisionFilter = CastRays.CollisionFilter
 
 local crosshair_bullet_ray_result = nil
 local crosshair_attack_ray_result = nil
@@ -382,32 +381,7 @@ local function write_valuetype(parent_obj, offset, value)
   end
 end
 
-local function cast_ray_async(ray_result, start_pos, end_pos, layer, filter_info)
-if layer == nil then
-  layer = CollisionLayer.Bullet
-end
-
-local via_physics_system = sdk.get_native_singleton("via.physics.System")
-local ray_query = sdk.create_instance("via.physics.CastRayQuery")
-local ray_result = ray_result or sdk.create_instance("via.physics.CastRayResult")
-
-ray_query:call("setRay(via.vec3, via.vec3)", start_pos, end_pos)
-ray_query:call("clearOptions")
-ray_query:call("enableAllHits")
-ray_query:call("enableNearSort")
-
-if filter_info == nil then
-  filter_info = ray_query:call("get_FilterInfo")
-  filter_info:call("set_Group", 0)
-  filter_info:call("set_MaskBits", 0xFFFFFFFF & ~1) -- everything except the player.
-  filter_info:call("set_Layer", layer)
-end
-
-ray_query:call("set_FilterInfo", filter_info)
-cast_ray_async_method:call(via_physics_system, ray_query, ray_result)
-
-return ray_result
-end
+local cast_ray_async = CastRays.cast_ray_async
 
 -- Laser trail management functions
 
