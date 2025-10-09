@@ -28,6 +28,11 @@ local wc = false
 
 local show_laser_dot = true -- Controls dot/crosshair visibility
 local hide_dot_when_no_muzzle = false -- Hide reticle/dot when no muzzle is found
+local spawn_from_head_joint = false -- Optionally spawn projectiles from the player's head joint
+local head_spawn_offset = head_spawn_offset or { x = 0.0, y = 0.0, z = 0.0 }
+
+re4.spawn_from_head_joint = spawn_from_head_joint
+re4.head_spawn_offset = head_spawn_offset
 
 re4.crosshair_pos = Vector3f.new(0, 0, 0)
 re4.crosshair_normal = Vector3f.new(0, 0, 0)
@@ -51,6 +56,8 @@ local crosshair_frozen_time = 0
 local vec3_t = sdk.find_type_definition("via.vec3")
 local quat_t = sdk.find_type_definition("via.Quaternion")
 local raycastHit_t = sdk.find_type_definition(sdk.game_namespace("RaycastHit"))
+local vec3_set_item = vec3_t:get_method("set_Item(System.Int32, System.Single)")
+local quat_set_item = quat_t:get_method("set_Item(System.Int32, System.Single)")
 
 global_intersection_point = nil
 local scene = nil
@@ -108,6 +115,92 @@ local CAMERA_RAYCAST_OFFSET = 2.0  -- Camera forward offset for raycast origin
 -- Table for per-weapon laser origin offsets
 laser_origin_offsets = laser_origin_offsets or {}
 
+local function get_camera_forward()
+  local camera = sdk.get_primary_camera()
+  if not camera then
+    return nil
+  end
+
+  local camera_mat = camera:get_WorldMatrix()
+  if not camera_mat then
+    return nil
+  end
+
+  local muzzle_rot = camera_mat:to_quat()
+  if not muzzle_rot then
+    return nil
+  end
+
+  local forward = muzzle_rot * Vector3f.new(0, 0, -1)
+  if forward and forward.length then
+    return forward:normalized()
+  end
+
+  return nil
+end
+
+local function get_player_head_joint()
+  local head_joint = nil
+
+  if re4.body then
+    local body_transform = re4.body:call("get_Transform")
+    if body_transform then
+      head_joint = body_transform:call("getJointByName", "Head")
+    end
+  end
+
+  if not head_joint and re4.head then
+    local head_transform = re4.head:call("get_Transform")
+    if head_transform then
+      head_joint = head_transform:call("getJointByName", "Head")
+    end
+  end
+
+  if not head_joint and cached_pl_head then
+    local cached_transform = cached_pl_head:get_Transform()
+    if cached_transform then
+      head_joint = cached_transform:call("getJointByName", "Head")
+    end
+  end
+
+  return head_joint
+end
+
+local function compute_head_spawn_transform()
+  local head_joint = get_player_head_joint()
+  if not head_joint then
+    return nil
+  end
+
+  local head_position = joint_get_position(head_joint)
+  if not head_position then
+    return nil
+  end
+
+  local offset = re4.head_spawn_offset or head_spawn_offset or { x = 0.0, y = 0.0, z = 0.0 }
+  local axis_x = head_joint:call("get_AxisX")
+  local axis_y = head_joint:call("get_AxisY")
+  local axis_z = head_joint:call("get_AxisZ")
+
+  local offset_world = Vector3f.new(offset.x, offset.y, offset.z)
+  if axis_x and axis_y and axis_z then
+    offset_world = (axis_x * offset.x) + (axis_y * offset.y) + (axis_z * offset.z)
+  end
+
+  local spawn_pos = head_position + offset_world
+
+  local forward = get_camera_forward()
+  if not forward and axis_z and axis_z.length then
+    forward = axis_z:normalized()
+  end
+
+  if not forward then
+    forward = Vector3f.new(0, 0, -1)
+  end
+
+  return spawn_pos, forward, head_joint
+end
+
 -- Laser trail variables
 local enable_laser_trail = true  -- Enable/disable laser trail
 local laser_trail_scale = 1.5   -- Scale of the laser trail
@@ -140,39 +233,73 @@ local last_hook_conditions = false -- Track previous state to detect changes
 -- Weapon firing hook functions for hold variation correction
 local function on_pre_request_fire(args)
   local shell_generator = sdk.to_managed_object(args[2])
-  local arrow_shell_generator = sdk.to_managed_object(args[2])
+  if not shell_generator then
+    return
+  end
+
   local gun = shell_generator:get_field("_OwnerInterface")
-  local muzzle_joint = gun:call("getMuzzleJoint")
-    if not muzzle_joint then
-      
-    end
+  if not gun then
+    return
+  end
+
   local owner = shell_generator:get_field("_Owner")
-  local name = owner:call("get_Name")
+  local name = owner and owner:call("get_Name")
+  if name == "wp4005" then
+    return
+  end
 
-  if not muzzle_joint then
+  local pos_addr = sdk.to_ptr(sdk.to_int64(args[3]))
+  local rot_addr = sdk.to_ptr(sdk.to_int64(args[4]))
+
+  if spawn_from_head_joint then
+    local head_pos, head_forward = compute_head_spawn_transform()
+    if head_pos and head_forward then
+      vec3_set_item:call(pos_addr, 0, head_pos.x)
+      vec3_set_item:call(pos_addr, 1, head_pos.y)
+      vec3_set_item:call(pos_addr, 2, head_pos.z)
+
+      local direction = head_forward
+      if global_intersection_point then
+        direction = (global_intersection_point - head_pos):normalized()
+      end
+
+      if direction then
+        local new_rotation = direction:to_quat()
+        quat_set_item:call(rot_addr, 0, new_rotation.x)
+        quat_set_item:call(rot_addr, 1, new_rotation.y)
+        quat_set_item:call(rot_addr, 2, new_rotation.z)
+        quat_set_item:call(rot_addr, 3, new_rotation.w)
+      end
+
+      return
+    end
+  end
+
+  local muzzle_joint = gun:call("getMuzzleJoint")
+  if not muzzle_joint and owner then
     local gun_transforms = owner:get_Transform()
-    muzzle_joint = gun_transforms:call("getJointByName", "vfx_muzzle")
-end
+    if gun_transforms then
+      muzzle_joint = gun_transforms:call("getJointByName", "vfx_muzzle")
+    end
+  end
 
-  if muzzle_joint ~= nil then
-    local muzzle_pos = muzzle_joint:call("get_Position")
-    local muzzle_rot = muzzle_joint:call("get_Rotation")
-    local set_item = vec3_t:get_method("set_Item(System.Int32, System.Single)")
-    local pos_addr = sdk.to_ptr(sdk.to_int64(args[3]))
-    set_item:call(pos_addr, 0, muzzle_pos.x)
-    set_item:call(pos_addr, 1, muzzle_pos.y)
-    set_item:call(pos_addr, 2, muzzle_pos.z)
+  if muzzle_joint then
+    local muzzle_pos = joint_get_position(muzzle_joint)
+    if not muzzle_pos then
+      return
+    end
+
+    vec3_set_item:call(pos_addr, 0, muzzle_pos.x)
+    vec3_set_item:call(pos_addr, 1, muzzle_pos.y)
+    vec3_set_item:call(pos_addr, 2, muzzle_pos.z)
 
     if global_intersection_point then
       local direction_to_intersection = (global_intersection_point - muzzle_pos):normalized()
       local new_rotation = direction_to_intersection:to_quat()
-
-      local set_item = quat_t:get_method("set_Item(System.Int32, System.Single)")
-      local rot_addr = sdk.to_ptr(sdk.to_int64(args[4]))
-      set_item:call(rot_addr, 0, new_rotation.x)
-      set_item:call(rot_addr, 1, new_rotation.y)
-      set_item:call(rot_addr, 2, new_rotation.z)
-      set_item:call(rot_addr, 3, new_rotation.w)
+      quat_set_item:call(rot_addr, 0, new_rotation.x)
+      quat_set_item:call(rot_addr, 1, new_rotation.y)
+      quat_set_item:call(rot_addr, 2, new_rotation.z)
+      quat_set_item:call(rot_addr, 3, new_rotation.w)
     end
   end
 end
@@ -208,17 +335,15 @@ end
 
 -- Function to manage hooks based on conditions (only when conditions change)
 local function manage_hooks(force_check)
-  -- Don't apply hook logic if static center dot (RE4 Remake style) is enabled
-  if static_center_dot then
-    -- If hooks are currently active but static mode is enabled, unhook them
-    if is_hooks_active then
-      unhook_request_fire()
-    end
-    last_hook_conditions = false
-    return
+  local should_hook = false
+
+  if spawn_from_head_joint then
+    should_hook = true
+  elseif static_center_dot then
+    should_hook = false
+  else
+    should_hook = is_hold_variation and current_weapon_id == 4600
   end
-  
-  local should_hook = is_hold_variation and current_weapon_id == 4600
   
   -- Only do something if the conditions have changed OR if forced
   if should_hook ~= last_hook_conditions or force_check then
@@ -246,6 +371,8 @@ local function save_config()
       enable_laser_trail = enable_laser_trail,  -- Add laser trail settings
       laser_trail_scale = laser_trail_scale,
       knife_dot_scale = knife_dot_scale,  -- Add knife dot scale
+  spawn_from_head_joint = spawn_from_head_joint,
+  head_spawn_offset = head_spawn_offset,
       laser_origin_offsets = laser_origin_offsets,    -- Persist weapon-specific offsets
       laser_mat_params = _G.laser_mat_params,        -- Persist material editor params
       -- Separate beam and dot colors
@@ -346,6 +473,18 @@ local function load_config()
   enable_laser_trail = data.enable_laser_trail or enable_laser_trail
   laser_trail_scale = data.laser_trail_scale or laser_trail_scale
   knife_dot_scale = data.knife_dot_scale or knife_dot_scale
+  spawn_from_head_joint = data.spawn_from_head_joint or spawn_from_head_joint
+  re4.spawn_from_head_joint = spawn_from_head_joint
+  if type(data.head_spawn_offset) == "table" then
+    head_spawn_offset.x = data.head_spawn_offset.x or head_spawn_offset.x
+    head_spawn_offset.y = data.head_spawn_offset.y or head_spawn_offset.y
+    head_spawn_offset.z = data.head_spawn_offset.z or head_spawn_offset.z
+  else
+    head_spawn_offset.x = data.head_spawn_offset_x or head_spawn_offset.x
+    head_spawn_offset.y = data.head_spawn_offset_y or head_spawn_offset.y
+    head_spawn_offset.z = data.head_spawn_offset_z or head_spawn_offset.z
+  end
+  re4.head_spawn_offset = head_spawn_offset
   
   -- Load separate beam and dot colors
   if data.laser_beam_color_array then
@@ -553,6 +692,8 @@ end
 local prev_weapon_id = current_weapon_id
 current_weapon_id = equip_weapon
 
+manage_hooks()
+
 -- Only check hooks if switching away from weapon 4600 (when hooks might be active)
 if prev_weapon_id == 4600 and current_weapon_id ~= 4600 and is_hooks_active then
   manage_hooks()
@@ -592,6 +733,20 @@ pcall(function()
     end
   end
 end)
+
+if spawn_from_head_joint then
+  local head_spawn_pos, head_forward, head_joint = compute_head_spawn_transform()
+  if head_spawn_pos and head_forward and head_joint then
+    is_non_muzzle_weapon = false
+    current_muzzle_joint = head_joint
+    re4.last_muzzle_pos = head_spawn_pos
+    re4.last_muzzle_forward = head_forward
+    re4.last_shoot_dir = head_forward
+    re4.last_shoot_pos = head_spawn_pos + (head_forward * 0.05)
+    re4.last_muzzle_joint = head_joint
+    return
+  end
+end
 
 if muzzle_joint then
   -- Has muzzle - normal weapon
@@ -827,6 +982,8 @@ end)
 end
 
 re.on_pre_application_entry("LockScene", function()
+re4.spawn_from_head_joint = spawn_from_head_joint
+re4.head_spawn_offset = head_spawn_offset
 -- Determine aiming state (is_aim) using CharacterContext, similar to reference
 pcall(function()
   local character_manager = sdk.get_managed_singleton(sdk.game_namespace("CharacterManager"))
@@ -1536,6 +1693,61 @@ re.on_draw_ui(function()
     if hide_muzzle_changed then
         save_config()
     end
+
+  local head_spawn_changed = false
+  head_spawn_changed, spawn_from_head_joint = imgui.checkbox("Spawn bullets from head joint", spawn_from_head_joint)
+  if imgui.is_item_hovered() then
+    imgui.set_tooltip("When enabled, projectiles originate from the player's Head joint instead of the weapon's muzzle.")
+  end
+  if head_spawn_changed then
+    re4.spawn_from_head_joint = spawn_from_head_joint
+    save_config()
+    manage_hooks(true)
+  end
+
+  if spawn_from_head_joint then
+    imgui.indent(20)
+    imgui.text_colored("Head spawn offset (meters)", 0xFFFFFFAA)
+
+    local offset_changed = false
+    local drag_speed = 0.005
+    local min_offset = -0.5
+    local max_offset = 0.5
+
+    local changed_x, new_x = imgui.drag_float("Right (+) / Left (-)", head_spawn_offset.x, drag_speed, min_offset, max_offset, "%.3f")
+    if changed_x then
+      head_spawn_offset.x = new_x
+      offset_changed = true
+    end
+    if imgui.is_item_hovered() then
+      imgui.set_tooltip("Strafe offset: positive moves bullets toward Leon's right.")
+    end
+
+    local changed_y, new_y = imgui.drag_float("Up (+) / Down (-)", head_spawn_offset.y, drag_speed, min_offset, max_offset, "%.3f")
+    if changed_y then
+      head_spawn_offset.y = new_y
+      offset_changed = true
+    end
+    if imgui.is_item_hovered() then
+      imgui.set_tooltip("Vertical offset: positive moves bullets upward.")
+    end
+
+    local changed_z, new_z = imgui.drag_float("Forward (+) / Back (-)", head_spawn_offset.z, drag_speed, min_offset, max_offset, "%.3f")
+    if changed_z then
+      head_spawn_offset.z = new_z
+      offset_changed = true
+    end
+    if imgui.is_item_hovered() then
+      imgui.set_tooltip("Depth offset: positive extends bullets in front of the head.")
+    end
+
+    if offset_changed then
+      re4.head_spawn_offset = head_spawn_offset
+      save_config()
+    end
+
+    imgui.unindent(20)
+  end
     
     imgui.end_rect(1)
   
@@ -2135,3 +2347,4 @@ re.on_draw_ui(function()
 end)
 
 load_config()
+manage_hooks(true)
