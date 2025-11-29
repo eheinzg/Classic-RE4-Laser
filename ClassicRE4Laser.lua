@@ -110,14 +110,61 @@ local pending_shoulder_restore = nil
 
 -- Static center dot positioning variables
 local static_target_intersection_point = nil  -- Target position from raycast
+local debug_raycast_distance = 0  -- Debug: track actual raycast distance
 
 -- Unified offset constants to avoid redundancy
 local SURFACE_OFFSET = 1.0  -- Distance to pull dot away from surfaces
 local TRAIL_OFFSET = 0.1    -- Small adjustment for trail positioning
 local CAMERA_RAYCAST_OFFSET = 2.0  -- Camera forward offset for raycast origin
 
--- Table for per-weapon laser origin offsets
+-- Default laser origin offsets for each weapon
+local default_laser_origin_offsets = {
+    ["4000"] = {x = 0.0, y = -0.04529999941587448, z = -0.007300000172108412},
+    ["4001"] = {x = 0.0, y = -0.04540000110864639, z = 0.004100000020116568},
+    ["4002"] = {x = 0.0, y = -0.02199999988079071, z = -0.060600001364946365},
+    ["4003"] = {x = 0.0, y = -0.05150000038146973, z = 0.0},
+    ["4004"] = {x = 0.0, y = -0.05260000038146973, z = -0.0494999997317791},
+    ["4100"] = {x = 0.0, y = -0.029500000178813934, z = -0.006800000090152025},
+    ["4101"] = {x = 0.0, y = -0.028699999675154686, z = -0.1889999955892563},
+    ["4102"] = {x = 0.0, y = -0.027800000250339508, z = 0.0},
+    ["4200"] = {x = -0.029400000348687172, y = 0.012900000438094139, z = -0.04780000075697899},
+    ["4201"] = {x = 0.0, y = -0.04780000075697899, z = -0.04780000075697899},
+    ["4202"] = {x = 0.0, y = 0.02850000001490116, z = -0.04830000177025795},
+    ["4400"] = {x = -0.027000000298023224, y = 0.007200000072002888, z = -0.0638000023841858},
+    ["4401"] = {x = -0.030500000342726707, y = 0.016499999910593033, z = -0.16910000145435333},
+    ["4402"] = {x = 0.0, y = -0.04479999840259552, z = -0.1324000060558319},
+    ["4500"] = {x = 0.0, y = -0.028999999165534973, z = -0.09700000286102295},
+    ["4501"] = {x = 0.0, y = 0.03999999910593033, z = -0.010999999940395355},
+    ["4502"] = {x = 0.0, y = -0.03280000016093254, z = -0.210999995470047},
+    ["4600"] = {x = 0.0, y = -0.02550000083446503, z = 0.0},
+    ["4900"] = {x = 0.060499999672174454, y = -0.017999999225139618, z = -0.2922000007629395},
+    ["4901"] = {x = 0.060499999672174454, y = -0.017000000149011612, z = -0.30590000009536743},
+    ["4902"] = {x = 0.060499999672174454, y = -0.017999999225139618, z = -0.2922000007629395},
+    ["6000"] = {x = 0.0, y = -0.049400001764297485, z = -0.043299999088048935},
+    ["6001"] = {x = 0.0, y = -0.04780000075697899, z = -0.04780000075697899},
+    ["6100"] = {x = 0.0, y = -0.03350000083446503, z = -0.0924000007629395},
+    ["6101"] = {x = 0.0, y = -0.0199000000298023224, z = -0.012199999988079071},
+    ["6102"] = {x = -0.04800000041723251, y = 0.013500000350177288, z = -0.050999999046325684},
+    ["6103"] = {x = 0.0, y = -0.05119999870657921, z = -0.013100000098347664},
+    ["6104"] = {x = -0.029400000348687172, y = 0.012900000438094139, z = -0.04820000007748604},
+    ["6105"] = {x = -0.030500000342726707, y = 0.016499999910593033, z = -0.17640000581741333},
+    ["6106"] = {x = 0.060499999672174454, y = -0.017999999225139618, z = -0.30140000581741333},
+    ["6111"] = {x = 0.060499999672174454, y = -0.017999999225139618, z = -0.30140000581741333},
+    ["6112"] = {x = 0.0, y = -0.04540000110864639, z = 0.0044999998062849045},
+    ["6113"] = {x = 0.0, y = -0.023600000888109207, z = -0.14149999618530273},
+    ["6114"] = {x = -0.027000000298023224, y = 0.007200000072002888, z = -0.0638000023841858},
+    ["6300"] = {x = 0.0, y = -0.04740000143647194, z = -0.003700000001117587},
+    ["6304"] = {x = -0.07500000298023224, y = 0.0010000000474974513, z = -0.05010000019073486}
+}
+
+-- Table for per-weapon laser origin offsets (initialize with defaults)
 laser_origin_offsets = laser_origin_offsets or {}
+-- Apply defaults for any missing weapon offsets
+for weapon_id, offset in pairs(default_laser_origin_offsets) do
+    if not laser_origin_offsets[weapon_id] then
+        laser_origin_offsets[weapon_id] = {x = offset.x, y = offset.y, z = offset.z}
+    end
+end
 
 -- Laser trail variables
 local enable_laser_trail = true  -- Enable/disable laser trail
@@ -479,10 +526,16 @@ if crosshair_attack_ray_result == nil or crosshair_bullet_ray_result == nil then
   crosshair_bullet_ray_result:add_ref()
 end
 
-local finished = crosshair_attack_ray_result:call("get_Finished") == true and crosshair_bullet_ray_result:call("get_Finished")
+local finished = crosshair_attack_ray_result:call("get_Finished") == true and crosshair_bullet_ray_result:call("get_Finished") == true
 local attack_hit = finished and crosshair_attack_ray_result:call("get_NumContactPoints") > 0
 local any_hit = finished and (attack_hit or crosshair_bullet_ray_result:call("get_NumContactPoints") > 0)
 local both_hit = finished and crosshair_attack_ray_result:call("get_NumContactPoints") > 0 and crosshair_bullet_ray_result:call("get_NumContactPoints") > 0
+
+-- Debug: track raycast state
+_G.debug_finished = finished
+_G.debug_any_hit = any_hit
+_G.debug_attack_contacts = finished and crosshair_attack_ray_result:call("get_NumContactPoints") or 0
+_G.debug_bullet_contacts = finished and crosshair_bullet_ray_result:call("get_NumContactPoints") or 0
 
 if finished and any_hit then
   local best_result = nil
@@ -501,13 +554,30 @@ if finished and any_hit then
 
   local contact_point = best_result:call("getContactPoint(System.UInt32)", 0)
   if contact_point then
+    local contact_distance = contact_point:get_field("Distance")
+    
+    -- Sky distance threshold: if hit is beyond 100m, clamp to 100m
+    local sky_distance_threshold = 100.0
+    if contact_distance and contact_distance > sky_distance_threshold then
+      contact_distance = sky_distance_threshold
+    end
+    
     re4.crosshair_dir = re4.crosshair_dir:normalized()
     re4.crosshair_pos = start_pos + (re4.crosshair_dir * re4.crosshair_distance * 1)
     re4.crosshair_dir = (end_pos - start_pos):normalized()
     re4.crosshair_normal = contact_point:get_field("Normal")
-    re4.crosshair_distance = contact_point:get_field("Distance")
+    re4.crosshair_distance = contact_distance
+    debug_raycast_distance = contact_distance  -- Debug: show actual distance
   end
+elseif finished and not any_hit then
+  -- Raycast finished but no hit (sky/empty space) - use default distance
+  local sky_distance = 100.0
+  re4.crosshair_dir = (end_pos - start_pos):normalized()
+  re4.crosshair_distance = sky_distance
+  re4.crosshair_pos = start_pos + (re4.crosshair_dir * sky_distance)
+  debug_raycast_distance = sky_distance  -- Debug
 else
+  -- Raycast still pending - keep updating position along current direction
   re4.crosshair_dir = (end_pos - start_pos):normalized()
   if re4.crosshair_distance then
     re4.crosshair_pos = start_pos + (re4.crosshair_dir * re4.crosshair_distance)
@@ -515,10 +585,11 @@ else
     re4.crosshair_pos = start_pos + (re4.crosshair_dir * 10.0)
     re4.crosshair_distance = 10.0
   end
+  debug_raycast_distance = re4.crosshair_distance or 10.0  -- Debug
 end
 
+-- Always restart the raycast when finished (whether hit or not)
 if finished then
-  -- restart it.
   cast_ray_async(crosshair_attack_ray_result, start_pos, end_pos, 5, CollisionFilter.DamageCheckOtherThanPlayer)
   cast_ray_async(crosshair_bullet_ray_result, start_pos, end_pos, 10)
 end
@@ -694,22 +765,37 @@ local function update_static_dot_interpolation()
         local contact_position = static_contact_point:get_field("Position")
         local contact_distance = static_contact_point:get_field("Distance")
         
-        -- Apply surface offset from contact point (using unified constant)
-        local new_target_intersection = contact_position - (camera_forward * SURFACE_OFFSET)
+        -- If contact distance is very far (sky/skybox), use default distance instead
+        local sky_distance_threshold = 100.0  -- Treat anything beyond 100m as "sky"
+        local actual_distance = contact_distance or (contact_position - camera_pos):length()
         
-        -- Hard limit: ensure dot never goes closer than 1.6 meters from camera
-        local min_distance_from_camera = 1.5
-        local camera_to_dot = new_target_intersection - camera_pos
-        local distance_from_camera = camera_to_dot:length()
-        if distance_from_camera < min_distance_from_camera then
-          static_target_intersection_point = camera_pos + (camera_forward * min_distance_from_camera)
+        -- DEBUG: Track the actual distance for UI display
+        debug_raycast_distance = actual_distance
+        
+        if actual_distance > sky_distance_threshold then
+          -- Aiming at sky or very far away - use default distance
+          static_target_intersection_point = camera_pos + (camera_forward * sky_distance_threshold)
         else
-          static_target_intersection_point = new_target_intersection
+          -- Apply surface offset from contact point (using unified constant)
+          local new_target_intersection = contact_position - (camera_forward * SURFACE_OFFSET)
+          
+          -- Hard limit: ensure dot never goes closer than 1.6 meters from camera
+          local min_distance_from_camera = 1.5
+          local camera_to_dot = new_target_intersection - camera_pos
+          local distance_from_camera = camera_to_dot:length()
+          if distance_from_camera < min_distance_from_camera then
+            static_target_intersection_point = camera_pos + (camera_forward * min_distance_from_camera)
+          else
+            static_target_intersection_point = new_target_intersection
+          end
         end
+      else
+        -- Contact point was nil - use default distance
+        static_target_intersection_point = camera_pos + (camera_forward * 100.0)
       end
     else
       -- No contact point found (aiming at sky/empty space) - use default distance
-      local default_distance = 50.0  -- Default distance when no collision
+      local default_distance = 100.0  -- Default distance when no collision
       local fallback_position = camera_pos + (camera_forward * default_distance)
       static_target_intersection_point = fallback_position
     end
@@ -1521,6 +1607,14 @@ end)
 re.on_draw_ui(function()
   if imgui.tree_node("Classic RE4 Laser Settings") then
     imgui.begin_rect()
+    -- DEBUG: Show live raycast distance and mode info
+    local mode_str = static_center_dot and "Remake Style" or "Classic Style"
+    local aim_str = _G.is_aim and "Aiming" or "Not Aiming"
+    local finished_str = _G.debug_finished and "FINISHED" or "PENDING"
+    local hit_str = _G.debug_any_hit and "HIT" or "NO HIT"
+    local contacts_str = "Atk:" .. tostring(_G.debug_attack_contacts or 0) .. " Bul:" .. tostring(_G.debug_bullet_contacts or 0)
+    imgui.text_colored(" DEBUG: " .. mode_str .. " | " .. aim_str .. " | " .. finished_str .. " | " .. hit_str .. " | " .. contacts_str .. " | Dist: " .. string.format("%.2f", debug_raycast_distance) .. "m", 0xFF00FFFF)
+    imgui.spacing()
     -- Laser Style Selection
     imgui.text_colored(" Laser Behavior:", 0xFFFFFFAA)
     imgui.same_line()
@@ -2088,44 +2182,11 @@ re.on_draw_ui(function()
       enable_laser_trail = true
       laser_trail_scale = 1.5
       hide_dot_when_no_muzzle = false
-      laser_origin_offsets = {
-          ["4000"] = {x = 0.0, y = -0.04529999941587448, z = -0.007300000172108412},
-          ["4001"] = {x = 0.0, y = -0.04540000110864639, z = 0.004100000020116568},
-          ["4002"] = {x = 0.0, y = -0.02199999988079071, z = -0.060600001364946365},
-          ["4003"] = {x = 0.0, y = -0.05150000038146973, z = 0.0},
-          ["4004"] = {x = 0.0, y = -0.05260000038146973, z = -0.0494999997317791},
-          ["4100"] = {x = 0.0, y = -0.029500000178813934, z = -0.006800000090152025},
-          ["4101"] = {x = 0.0, y = -0.028699999675154686, z = -0.1889999955892563},
-          ["4102"] = {x = 0.0, y = -0.027800000250339508, z = 0.0},
-          ["4200"] = {x = -0.029400000348687172, y = 0.012900000438094139, z = -0.04780000075697899},
-          ["4201"] = {x = 0.0, y = -0.04780000075697899, z = -0.04780000075697899},
-          ["4202"] = {x = 0.0, y = 0.02850000001490116, z = -0.04830000177025795},
-          ["4400"] = {x = -0.027000000298023224, y = 0.007200000072002888, z = -0.0638000023841858},
-          ["4401"] = {x = -0.030500000342726707, y = 0.016499999910593033, z = -0.16910000145435333},
-          ["4402"] = {x = 0.0, y = -0.04479999840259552, z = -0.1324000060558319},
-          ["4500"] = {x = 0.0, y = -0.028999999165534973, z = -0.09700000286102295},
-          ["4501"] = {x = 0.0, y = 0.03999999910593033, z = -0.010999999940395355},
-          ["4502"] = {x = 0.0, y = -0.03280000016093254, z = -0.210999995470047},
-          ["4600"] = {x = 0.0, y = -0.02550000083446503, z = 0.0},
-          ["4900"] = {x = 0.060499999672174454, y = -0.017999999225139618, z = -0.2922000007629395},
-          ["4901"] = {x = 0.060499999672174454, y = -0.017000000149011612, z = -0.30590000009536743},
-          ["4902"] = {x = 0.060499999672174454, y = -0.017999999225139618, z = -0.2922000007629395},
-          ["6000"] = {x = 0.0, y = -0.049400001764297485, z = -0.043299999088048935},
-          ["6001"] = {x = 0.0, y = -0.04780000075697899, z = -0.04780000075697899},
-          ["6100"] = {x = 0.0, y = -0.03350000083446503, z = -0.0924000007629395},
-          ["6101"] = {x = 0.0, y = -0.0199000000298023224, z = -0.012199999988079071},
-          ["6102"] = {x = -0.04800000041723251, y = 0.013500000350177288, z = -0.050999999046325684},
-          ["6103"] = {x = 0.0, y = -0.05119999870657921, z = -0.013100000098347664},
-          ["6104"] = {x = -0.029400000348687172, y = 0.012900000438094139, z = -0.04820000007748604},
-          ["6105"] = {x = -0.030500000342726707, y = 0.016499999910593033, z = -0.17640000581741333},
-          ["6106"] = {x = 0.060499999672174454, y = -0.017999999225139618, z = -0.30140000581741333},
-          ["6111"] = {x = 0.060499999672174454, y = -0.017999999225139618, z = -0.30140000581741333},
-          ["6112"] = {x = 0.0, y = -0.04540000110864639, z = 0.0044999998062849045},
-          ["6113"] = {x = 0.0, y = -0.023600000888109207, z = -0.14149999618530273},
-          ["6114"] = {x = -0.027000000298023224, y = 0.007200000072002888, z = -0.0638000023841858},
-          ["6300"] = {x = 0.0, y = -0.04740000143647194, z = -0.003700000001117587},
-          ["6304"] = {x = -0.07500000298023224, y = 0.0010000000474974513, z = -0.05010000019073486}
-      }
+      -- Reset laser origin offsets to defaults
+      laser_origin_offsets = {}
+      for weapon_id, offset in pairs(default_laser_origin_offsets) do
+          laser_origin_offsets[weapon_id] = {x = offset.x, y = offset.y, z = offset.z}
+      end
       
       -- Reset beam material parameters if laser trail exists (before clearing defaults)
       if laser_trail_gameobject then
