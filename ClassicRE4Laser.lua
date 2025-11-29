@@ -2,6 +2,9 @@ if reframework:get_game_name() ~= "re4" then
   return
 end
 
+-- Signal to other scripts that Classic RE4 Laser is present
+_G.__classic_re4_laser_present = true
+
 local re4 = require("utility/RE4")
 local hk = require("Hotkeys/Hotkeys")
 local CastRays = require("utility/CastRays")
@@ -99,6 +102,11 @@ local static_attack_ray_result = nil  -- Persistent ray result for attack layer
 local static_bullet_ray_result = nil  -- Persistent ray result for bullet layer
 local stored_static_center_dot = nil  -- Cache user preference when forced overrides run
 local force_classic_re4_prev = false  -- Track previous force state to restore preference
+local force_disable_shoulder_prev = false  -- Track previous force disable state (IronSight or FP mode)
+local stored_disable_shoulder_corrector = nil  -- Cache shoulder corrector preference across forced states
+local SHOULDER_RESTORE_DELAY_FRAMES = 30 -- Frames to wait before restoring shoulder corrector
+local shoulder_restore_frames = 0
+local pending_shoulder_restore = nil
 
 -- Static center dot positioning variables
 local static_target_intersection_point = nil  -- Target position from raycast
@@ -139,6 +147,251 @@ local is_hold_variation = false
 local is_hooks_active = false
 local bullet_hook = nil
 local last_hook_conditions = false -- Track previous state to detect changes
+
+-- Perfect Accuracy (zero spread) state
+local spread_fields = {
+    random = "_RandomRadius",
+    randomFit = "_RandomRadius_Fit",
+}
+
+local spread_state = {
+    cache = {},  -- { [key] = { object = move_info, values = { random = x, randomFit = y } } }
+    applied_zero = false,
+    target_zero = false,
+    current_weapon_id = nil,
+    needs_update = false,
+}
+
+local function is_valid_managed(obj)
+    if obj == nil then return false end
+    if type(obj) ~= "userdata" then return false end
+    local ok, result = pcall(function()
+        return obj:get_type_definition() ~= nil
+    end)
+    return ok and result
+end
+
+local function read_spread_field(param, field)
+    local ok, value = pcall(function()
+        return param:get_field(field)
+    end)
+    if ok then return value end
+    return nil
+end
+
+local function write_spread_field(param, field, value)
+    pcall(function()
+        param:set_field(field, value)
+    end)
+end
+
+local function apply_zero_spread(param)
+    write_spread_field(param, spread_fields.random, 0.0)
+    write_spread_field(param, spread_fields.randomFit, 0.0)
+end
+
+local function restore_spread(param, values)
+    if not values then return end
+    if values.random ~= nil then
+        write_spread_field(param, spread_fields.random, values.random)
+    end
+    if values.randomFit ~= nil then
+        write_spread_field(param, spread_fields.randomFit, values.randomFit)
+    end
+end
+
+local function register_spread_target(move_info)
+    if not move_info or not is_valid_managed(move_info) then return end
+    
+    local key = tostring(move_info)
+    local entry = spread_state.cache[key]
+    if not entry then
+        local spread_values = {
+            random = read_spread_field(move_info, spread_fields.random),
+            randomFit = read_spread_field(move_info, spread_fields.randomFit),
+        }
+        spread_state.cache[key] = {
+            object = move_info,
+            values = spread_values,
+        }
+    else
+        entry.object = move_info
+    end
+end
+
+-- Recursively find MoveInfo objects from shell userdata
+local function register_spread_targets_from_shell(shell_userdata)
+    if not shell_userdata or not is_valid_managed(shell_userdata) then return end
+
+    local function handle_candidate(candidate)
+        if candidate == nil then return end
+
+        if type(candidate) == "table" then
+            for _, element in ipairs(candidate) do
+                handle_candidate(element)
+            end
+            return
+        end
+
+        if not is_valid_managed(candidate) then return end
+
+        local ok_move, move_info = pcall(function()
+            return candidate:get_field("_MoveInfo")
+        end)
+        if ok_move and move_info and is_valid_managed(move_info) then
+            register_spread_target(move_info)
+            return
+        end
+
+        local iterator_success = false
+
+        if type(candidate.get_elements) == "function" then
+            local ok_elements, elements = pcall(function()
+                return candidate:get_elements()
+            end)
+            if ok_elements and elements then
+                iterator_success = true
+                for _, element in ipairs(elements) do
+                    handle_candidate(element)
+                end
+            end
+        end
+
+        if not iterator_success and type(candidate.call) == "function" then
+            local ok_count, count = pcall(function()
+                return candidate:call("get_Count")
+            end)
+            if ok_count and type(count) == "number" and count > 0 then
+                iterator_success = true
+                for i = 0, count - 1 do
+                    local ok_item, item = pcall(function()
+                        return candidate:call("get_Item", i)
+                    end)
+                    if ok_item and item then
+                        handle_candidate(item)
+                    end
+                end
+            end
+        end
+
+        if not iterator_success then
+            local ok_fields, fields = pcall(function()
+                return candidate:get_type_definition():get_fields()
+            end)
+            if ok_fields and fields then
+                for _, field in ipairs(fields) do
+                    if field:get_name():match("ShellInfoUserData") then
+                        local ok_sub, sub_obj = pcall(function()
+                            return candidate:get_field(field:get_name())
+                        end)
+                        if ok_sub and sub_obj then
+                            handle_candidate(sub_obj)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local candidate_fields = {
+        "_ShellInfoUserData",
+        "_CenterShellInfoUserData",
+        "_AroundShellInfoUserData",
+        "_ShellInfoUserDataList",
+        "_ShellInfoUserDataArray",
+    }
+
+    for _, field_name in ipairs(candidate_fields) do
+        local ok_field, field_obj = pcall(function()
+            return shell_userdata:get_field(field_name)
+        end)
+        if ok_field and field_obj then
+            handle_candidate(field_obj)
+        end
+    end
+
+    handle_candidate(shell_userdata)
+end
+
+local function clear_spread_cache()
+    -- Restore all spread values before clearing
+    for key, entry in pairs(spread_state.cache) do
+        local param = entry.object
+        if param and is_valid_managed(param) then
+            restore_spread(param, entry.values)
+        end
+    end
+    spread_state.cache = {}
+    spread_state.applied_zero = false
+    spread_state.target_zero = false
+    spread_state.current_weapon_id = nil
+    spread_state.needs_update = false
+end
+
+local function update_perfect_accuracy()
+    local perfect_accuracy_on = (_G.standalone_perfect_accuracy_enabled ~= false)
+    local is_aiming = (_G.is_aim == true)
+    
+    local should_zero = perfect_accuracy_on and is_aiming
+    
+    -- Detect weapon change
+    local weapon_id = current_weapon_id
+    if weapon_id ~= spread_state.current_weapon_id then
+        -- Weapon changed, clear cache and re-scan
+        clear_spread_cache()
+        spread_state.current_weapon_id = weapon_id
+        spread_state.needs_update = true
+    end
+    
+    -- Detect target state change
+    if spread_state.target_zero ~= should_zero then
+        spread_state.target_zero = should_zero
+        spread_state.needs_update = true
+    end
+    
+    -- Scan for spread targets if needed
+    if should_zero and spread_state.needs_update then
+        -- Try to find ShellGenerator from player's gun
+        if re4.player and re4.gun then
+            local ok_shell, shell_gen = pcall(function()
+                return re4.gun:call("get_ShellGenerator")
+            end)
+            if ok_shell and shell_gen and is_valid_managed(shell_gen) then
+                local ok_shell_data, shell_data = pcall(function()
+                    return shell_gen:get_field("_ShellUserData")
+                end)
+                if ok_shell_data and shell_data then
+                    register_spread_targets_from_shell(shell_data)
+                end
+            end
+        end
+    end
+    
+    -- Apply or restore spread
+    if should_zero then
+        for key, entry in pairs(spread_state.cache) do
+            local param = entry.object
+            if param and is_valid_managed(param) then
+                apply_zero_spread(param)
+            else
+                spread_state.cache[key] = nil
+            end
+        end
+        spread_state.applied_zero = true
+    else
+        if spread_state.applied_zero then
+            for key, entry in pairs(spread_state.cache) do
+                local param = entry.object
+                if param and is_valid_managed(param) then
+                    restore_spread(param, entry.values)
+                end
+            end
+            spread_state.applied_zero = false
+        end
+    end
+    
+    spread_state.needs_update = false
+end
 
 -- Weapon firing hook functions for hold variation correction
 local function on_pre_request_fire(args)
@@ -252,6 +505,7 @@ local function save_config()
       laser_origin_offsets = laser_origin_offsets,    -- Persist weapon-specific offsets
       laser_mat_params = _G.laser_mat_params,        -- Persist material editor params
       disable_shoulder_corrector = disable_shoulder_corrector,  -- Save shoulder corrector disable state
+      perfect_accuracy_enabled = _G.standalone_perfect_accuracy_enabled,  -- Save perfect accuracy state
       -- Separate beam and dot colors
       laser_beam_color_array = laser_beam_color_array,
       laser_dot_color_array = laser_dot_color_array,
@@ -350,6 +604,11 @@ local function load_config()
   enable_laser_trail = data.enable_laser_trail or enable_laser_trail
   laser_trail_scale = data.laser_trail_scale or laser_trail_scale
   knife_dot_scale = data.knife_dot_scale or knife_dot_scale
+  
+  -- Load perfect accuracy state
+  if data.perfect_accuracy_enabled ~= nil then
+    _G.standalone_perfect_accuracy_enabled = data.perfect_accuracy_enabled
+  end
   
   -- Load separate beam and dot colors
   if data.laser_beam_color_array then
@@ -653,8 +912,10 @@ local function update_static_dot_interpolation()
   local camera_rot = joint_get_rotation(camera_joint)
   local camera_forward = camera_rot:to_mat4()[2] * -1.0  -- Forward direction
 
-  -- Add camera offset for raycast origin (using unified constant)
-  local offset_camera_pos = camera_pos + (camera_forward * CAMERA_RAYCAST_OFFSET)
+  -- Add camera offset for raycast origin (reduce to 0 in first person mode)
+  local fp_active = rawget(_G, "standalone_first_person_active") == true
+  local raycast_offset = fp_active and 0.0 or CAMERA_RAYCAST_OFFSET
+  local offset_camera_pos = camera_pos + (camera_forward * raycast_offset)
   
   -- Calculate end point like working crosshair
   local cam_end = offset_camera_pos + (camera_forward * 8192.0)
@@ -866,25 +1127,59 @@ pcall(function()
 end)
 
 local force_classic = (_G.force_classic_re4_style == true)
-if force_classic then
-  if not force_classic_re4_prev then
+local fp_active = (rawget(_G, "standalone_first_person_active") == true)
+local force_disable_shoulder = force_classic or fp_active
+
+if force_disable_shoulder then
+  pending_shoulder_restore = nil
+  shoulder_restore_frames = 0
+  if not force_disable_shoulder_prev then
     stored_static_center_dot = static_center_dot
+    stored_disable_shoulder_corrector = disable_shoulder_corrector
   end
-  if static_center_dot then
+  if force_classic and static_center_dot then
     static_center_dot = false
     hasRunInitially = false
     manage_hooks(true)
   end
+  if not disable_shoulder_corrector then
+    disable_shoulder_corrector = true
+    hasRunInitially = false
+  end
 else
-  if force_classic_re4_prev then
+  if force_disable_shoulder_prev then
     if stored_static_center_dot ~= nil and static_center_dot ~= stored_static_center_dot then
       static_center_dot = stored_static_center_dot
       hasRunInitially = false
       manage_hooks(true)
     end
+    if stored_disable_shoulder_corrector ~= nil then
+      if disable_shoulder_corrector ~= stored_disable_shoulder_corrector then
+        pending_shoulder_restore = stored_disable_shoulder_corrector
+        shoulder_restore_frames = SHOULDER_RESTORE_DELAY_FRAMES
+      else
+        pending_shoulder_restore = nil
+        shoulder_restore_frames = 0
+      end
+    end
     stored_static_center_dot = nil
+    stored_disable_shoulder_corrector = nil
   end
 end
+
+if not force_disable_shoulder and pending_shoulder_restore ~= nil then
+  if shoulder_restore_frames > 0 then
+    shoulder_restore_frames = shoulder_restore_frames - 1
+  else
+    if disable_shoulder_corrector ~= pending_shoulder_restore then
+      disable_shoulder_corrector = pending_shoulder_restore
+      hasRunInitially = false
+    end
+    pending_shoulder_restore = nil
+  end
+end
+
+force_disable_shoulder_prev = force_disable_shoulder
 force_classic_re4_prev = force_classic
 
 if (os.clock() - last_crosshair_time) < 1.0 then
@@ -1315,7 +1610,11 @@ local function updateReticles()
     end
 
     -- Check if shoulder corrector should be disabled
-    if disable_shoulder_corrector then
+    -- Also force disable when FirstPersonMode is active
+    local fp_active = rawget(_G, "standalone_first_person_active") == true
+    local should_disable = disable_shoulder_corrector or fp_active
+    
+    if should_disable then
       -- Set all values to 0 to disable shoulder correction
       local correctorFields = {
         "_WeaponShoulderCorrectorMaxAngleY",
@@ -1432,6 +1731,7 @@ local function resetValues()
   scene = nil
   hasRunInitially = false
   destroy_laser_trail()  -- Clean up laser trail when resetting
+  clear_spread_cache()   -- Clean up perfect accuracy state
 end
 
 re.on_pre_application_entry("LockScene", function()
@@ -1457,6 +1757,9 @@ re.on_pre_application_entry("LockScene", function()
   
   -- Always update muzzle and laser every frame  
     update_muzzle_and_laser_data()
+  
+  -- Update perfect accuracy (zero spread) based on aim state
+  update_perfect_accuracy()
 
   if (static_center_dot) then
     update_static_dot_interpolation() -- Update static dot sync once per frame
@@ -1561,6 +1864,16 @@ re.on_draw_ui(function()
     end
     if hide_muzzle_changed then
         save_config()
+    end
+    
+    local perfect_accuracy_enabled = _G.standalone_perfect_accuracy_enabled ~= false
+    local pa_changed, pa_new = imgui.checkbox("Perfect Accuracy", perfect_accuracy_enabled)
+    if pa_changed then
+        _G.standalone_perfect_accuracy_enabled = pa_new
+        save_config()
+    end
+    if imgui.is_item_hovered() then
+        imgui.set_tooltip("Force zero weapon spread while aiming. Bullets go exactly where the crosshair points.")
     end
     
     imgui.end_rect(1)
