@@ -110,7 +110,6 @@ local pending_shoulder_restore = nil
 
 -- Static center dot positioning variables
 local static_target_intersection_point = nil  -- Target position from raycast
-local debug_raycast_distance = 0  -- Debug: track actual raycast distance
 
 -- Unified offset constants to avoid redundancy
 local SURFACE_OFFSET = 1.0  -- Distance to pull dot away from surfaces
@@ -531,12 +530,6 @@ local attack_hit = finished and crosshair_attack_ray_result:call("get_NumContact
 local any_hit = finished and (attack_hit or crosshair_bullet_ray_result:call("get_NumContactPoints") > 0)
 local both_hit = finished and crosshair_attack_ray_result:call("get_NumContactPoints") > 0 and crosshair_bullet_ray_result:call("get_NumContactPoints") > 0
 
--- Debug: track raycast state
-_G.debug_finished = finished
-_G.debug_any_hit = any_hit
-_G.debug_attack_contacts = finished and crosshair_attack_ray_result:call("get_NumContactPoints") or 0
-_G.debug_bullet_contacts = finished and crosshair_bullet_ray_result:call("get_NumContactPoints") or 0
-
 if finished and any_hit then
   local best_result = nil
 
@@ -567,7 +560,6 @@ if finished and any_hit then
     re4.crosshair_dir = (end_pos - start_pos):normalized()
     re4.crosshair_normal = contact_point:get_field("Normal")
     re4.crosshair_distance = contact_distance
-    debug_raycast_distance = contact_distance  -- Debug: show actual distance
   end
 elseif finished and not any_hit then
   -- Raycast finished but no hit (sky/empty space) - use default distance
@@ -575,7 +567,6 @@ elseif finished and not any_hit then
   re4.crosshair_dir = (end_pos - start_pos):normalized()
   re4.crosshair_distance = sky_distance
   re4.crosshair_pos = start_pos + (re4.crosshair_dir * sky_distance)
-  debug_raycast_distance = sky_distance  -- Debug
 else
   -- Raycast still pending - keep updating position along current direction
   re4.crosshair_dir = (end_pos - start_pos):normalized()
@@ -585,7 +576,6 @@ else
     re4.crosshair_pos = start_pos + (re4.crosshair_dir * 10.0)
     re4.crosshair_distance = 10.0
   end
-  debug_raycast_distance = re4.crosshair_distance or 10.0  -- Debug
 end
 
 -- Always restart the raycast when finished (whether hit or not)
@@ -768,9 +758,6 @@ local function update_static_dot_interpolation()
         -- If contact distance is very far (sky/skybox), use default distance instead
         local sky_distance_threshold = 100.0  -- Treat anything beyond 100m as "sky"
         local actual_distance = contact_distance or (contact_position - camera_pos):length()
-        
-        -- DEBUG: Track the actual distance for UI display
-        debug_raycast_distance = actual_distance
         
         if actual_distance > sky_distance_threshold then
           -- Aiming at sky or very far away - use default distance
@@ -1607,14 +1594,6 @@ end)
 re.on_draw_ui(function()
   if imgui.tree_node("Classic RE4 Laser Settings") then
     imgui.begin_rect()
-    -- DEBUG: Show live raycast distance and mode info
-    local mode_str = static_center_dot and "Remake Style" or "Classic Style"
-    local aim_str = _G.is_aim and "Aiming" or "Not Aiming"
-    local finished_str = _G.debug_finished and "FINISHED" or "PENDING"
-    local hit_str = _G.debug_any_hit and "HIT" or "NO HIT"
-    local contacts_str = "Atk:" .. tostring(_G.debug_attack_contacts or 0) .. " Bul:" .. tostring(_G.debug_bullet_contacts or 0)
-    imgui.text_colored(" DEBUG: " .. mode_str .. " | " .. aim_str .. " | " .. finished_str .. " | " .. hit_str .. " | " .. contacts_str .. " | Dist: " .. string.format("%.2f", debug_raycast_distance) .. "m", 0xFF00FFFF)
-    imgui.spacing()
     -- Laser Style Selection
     imgui.text_colored(" Laser Behavior:", 0xFFFFFFAA)
     imgui.same_line()
