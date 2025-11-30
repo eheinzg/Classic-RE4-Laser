@@ -57,6 +57,11 @@ local quat_t = sdk.find_type_definition("via.Quaternion")
 local raycastHit_t = sdk.find_type_definition(sdk.game_namespace("RaycastHit"))
 
 global_intersection_point = nil
+
+-- Global flag for other mods to check if Classic RE4 Style mode is active
+-- When true, bullet spawn is handled by ClassicRE4Laser (not IronSight.lua)
+_G.classic_re4_laser_bullet_spawn_active = false
+
 local scene = nil
 local gun_obj = nil
 
@@ -428,6 +433,9 @@ local function load_config()
   if data.laser_mat_params then
     _G.laser_mat_params = data.laser_mat_params
   end
+  
+  -- Update global flag for other mods to know Classic RE4 Style bullet spawn is active
+  _G.classic_re4_laser_bullet_spawn_active = (not static_center_dot)
   
   apply_laser_trail_settings()
   return true
@@ -955,37 +963,42 @@ local force_disable_shoulder = force_classic or fp_active
 if force_disable_shoulder then
   pending_shoulder_restore = nil
   shoulder_restore_frames = 0
-  if not force_disable_shoulder_prev then
-    stored_static_center_dot = static_center_dot
-    stored_disable_shoulder_corrector = disable_shoulder_corrector
-  end
-  if force_classic and static_center_dot then
-    static_center_dot = false
-    hasRunInitially = false
-    manage_hooks(true)
-  end
   if not disable_shoulder_corrector then
     disable_shoulder_corrector = true
     hasRunInitially = false
   end
 else
+  -- When iron sight or first person mode is toggled off, always uncheck Disable Shoulder Corrector
   if force_disable_shoulder_prev then
+    pending_shoulder_restore = false  -- Always restore to unchecked
+    shoulder_restore_frames = SHOULDER_RESTORE_DELAY_FRAMES
+  end
+end
+
+-- Handle force_classic separately for static_center_dot restoration
+-- This allows restoring RE4 Remake Style when iron sight is toggled off, even if FP mode is still active
+if force_classic then
+  if not force_classic_re4_prev then
+    -- Just entered force_classic - store current state
+    stored_static_center_dot = static_center_dot
+  end
+  if static_center_dot then
+    static_center_dot = false
+    _G.classic_re4_laser_bullet_spawn_active = true  -- Classic RE4 Style handles bullet spawn
+    hasRunInitially = false
+    manage_hooks(true)
+  end
+else
+  -- force_classic is false - check if we need to restore
+  if force_classic_re4_prev then
+    -- Just exited force_classic - restore previous state
     if stored_static_center_dot ~= nil and static_center_dot ~= stored_static_center_dot then
       static_center_dot = stored_static_center_dot
+      _G.classic_re4_laser_bullet_spawn_active = (not static_center_dot)  -- Update based on restored state
       hasRunInitially = false
       manage_hooks(true)
     end
-    if stored_disable_shoulder_corrector ~= nil then
-      if disable_shoulder_corrector ~= stored_disable_shoulder_corrector then
-        pending_shoulder_restore = stored_disable_shoulder_corrector
-        shoulder_restore_frames = SHOULDER_RESTORE_DELAY_FRAMES
-      else
-        pending_shoulder_restore = nil
-        shoulder_restore_frames = 0
-      end
-    end
     stored_static_center_dot = nil
-    stored_disable_shoulder_corrector = nil
   end
 end
 
@@ -1643,11 +1656,13 @@ re.on_draw_ui(function()
     -- Handle button presses
     if classic_pressed and static_center_dot then
         static_center_dot = false
+        _G.classic_re4_laser_bullet_spawn_active = true  -- Classic RE4 Style handles bullet spawn
         save_config()
         hasRunInitially = false
         manage_hooks(true)  -- Force check hooks when switching to dynamic mode
     elseif remake_pressed and not static_center_dot then
         static_center_dot = true
+        _G.classic_re4_laser_bullet_spawn_active = false  -- RE4 Remake Style - let other mods handle bullet spawn
         dot_scale = 0.85
         save_config()
         hasRunInitially = false
@@ -2093,6 +2108,7 @@ re.on_draw_ui(function()
       knife_dot_scale = 1.0
       crosshair_saturation = 20.0
       static_center_dot = false
+      _G.classic_re4_laser_bullet_spawn_active = true  -- Classic RE4 Style handles bullet spawn
       simple_static_mode = false
       disable_shoulder_corrector = false
       hide_dot_when_no_muzzle = false
@@ -2156,6 +2172,7 @@ re.on_draw_ui(function()
       laser_color_array = {1.0, 0.0, 0.0, 1.0}
       crosshair_saturation = 20.0
       static_center_dot = false
+      _G.classic_re4_laser_bullet_spawn_active = true  -- Classic RE4 Style handles bullet spawn
       static_lerp_speed = 50.0
       simple_static_mode = false
       enable_laser_trail = true
