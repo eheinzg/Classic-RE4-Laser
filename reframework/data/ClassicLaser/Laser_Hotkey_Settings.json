@@ -1,0 +1,10 @@
+{
+    "hotkeys": {
+        "Laser Modifier": "R Mouse",
+        "Laser Toggle": "EX1",
+        "Pad Laser Modifier": "LT (L2)",
+        "Pad Laser Toggle": "A (X)"
+    },
+    "use_modifier": true,
+    "use_pad_modifier": true
+}
