@@ -32,6 +32,7 @@ local changed = false
 local wc = false
 
 local show_laser_dot = true -- Controls dot/crosshair visibility
+local keep_laser_always_on = false -- When true, keep laser on until toggled off (ignore aim states, use advanced mode)
 local hide_dot_when_no_muzzle = false -- Hide reticle/dot when no muzzle is found
 
 re4.crosshair_pos = Vector3f.new(0, 0, 0)
@@ -195,6 +196,9 @@ local any_preset_active_prev = false  -- Track previous preset state to update h
 local iron_sight_active_prev = false  -- Track iron sight active state (aiming) to update hooks
 local force_disable_shoulder_prev = false  -- Track previous force disable state (IronSight or FP mode)
 local last_crosshair_active_time = 0  -- Track when crosshair was last active for grace period
+local last_laser_trail_active_time = 0  -- Track when laser trail was last active for grace period
+local was_laser_trail_active_prev = false  -- Track previous frame's trail active state
+local aim_start_time = 0  -- Track when aiming started for delay
 local stored_disable_shoulder_corrector = nil  -- Cache shoulder corrector preference across forced states
 local SHOULDER_RESTORE_DELAY_FRAMES = 30 -- Frames to wait before restoring shoulder corrector
 local shoulder_restore_frames = 0
@@ -451,9 +455,22 @@ local function save_config()
 end
 
 
+-- Helper to check if laser trail game object is valid
+local function is_laser_trail_valid()
+  if not laser_trail_gameobject then return false end
+  local success, valid = pcall(function() return laser_trail_gameobject:get_Valid() end)
+  if not success or not valid then
+    laser_trail_gameobject = nil
+    laser_mesh_resource = nil
+    laser_material_resource = nil
+    return false
+  end
+  return true
+end
+
 -- Apply loaded laser trail material params to the mesh/material
 local function apply_laser_trail_settings()
-  if not laser_trail_gameobject then return end
+  if not is_laser_trail_valid() then return end
   local mesh_component = laser_trail_gameobject:call("getComponent(System.Type)", sdk.typeof("via.render.Mesh"))
   if not mesh_component then return end
   if _G.laser_mat_params then
@@ -482,7 +499,7 @@ end
 
 -- Function to apply beam color to the laser trail material
 local function apply_beam_color(color_array)
-  if not laser_trail_gameobject then return end
+  if not is_laser_trail_valid() then return end
   local mesh_component = laser_trail_gameobject:call("getComponent(System.Type)", sdk.typeof("via.render.Mesh"))
   if not mesh_component or not mesh_component.setMaterialFloat4 then return end
   
@@ -604,46 +621,45 @@ local function create_laser_trail()
   laser_trail_table["trail"] = laser_trail_gameobject
 
   -- Create mesh component and load resources
-  pcall(function()
-    local mesh_component = laser_trail_gameobject:call("createComponent(System.Type)", sdk.typeof("via.render.Mesh"))
-    if mesh_component then
-      mesh_component:set_DrawShadowCast(false)
-      -- Load the specific laser mesh you requested
-      if not laser_mesh_resource then
-        laser_mesh_resource = sdk.create_resource("via.render.MeshResource", "_chainsaw/character/wp/wp40/wp4000/21/wp4000_22.mesh")
-        if laser_mesh_resource then
-          laser_mesh_resource:add_ref()
-        end
-      end
-      
-      if laser_mesh_resource then
-        local mesh_resource_holder = sdk.create_instance("via.render.MeshResourceHolder", true)
-        if mesh_resource_holder then
-          mesh_resource_holder:add_ref()
-          mesh_resource_holder:write_qword(0x10, laser_mesh_resource:get_address())
+  local mesh_component = laser_trail_gameobject:call("createComponent(System.Type)", sdk.typeof("via.render.Mesh"))
+  if mesh_component then
+    mesh_component:set_DrawShadowCast(false)
+    -- Always recreate mesh resource to ensure it's valid for this scene
+    laser_mesh_resource = sdk.create_resource("via.render.MeshResource", "_chainsaw/character/wp/wp40/wp4000/21/wp4000_22.mesh")
+    if laser_mesh_resource then
+      laser_mesh_resource:add_ref()
+    end
+    
+    if laser_mesh_resource and laser_mesh_resource:get_address() ~= 0 then
+      local mesh_resource_holder = sdk.create_instance("via.render.MeshResourceHolder", true)
+      if mesh_resource_holder and mesh_resource_holder:get_address() ~= 0 then
+        mesh_resource_holder:add_ref()
+        mesh_resource_holder:write_qword(0x10, laser_mesh_resource:get_address())
+        -- Only call setMesh if both objects have valid addresses
+        if mesh_component:get_address() ~= 0 then
           mesh_component:setMesh(mesh_resource_holder)
         end
       end
-      
-      -- Load and apply the specific material you requested
-      if not laser_material_resource then
-        laser_material_resource = sdk.create_resource("via.render.MeshMaterialResource", "LaserColors/classicRE4LaserMaterial.mdf2")  -- Laser material resource
-        if laser_material_resource then
-          laser_material_resource:add_ref()
-        end
-      end
-      
-      if laser_material_resource then
-        -- Create material holder and apply material using set_Material()
-        local material_holder = sdk.create_instance("via.render.MeshMaterialResourceHolder", true)
-        if material_holder then
-          material_holder:add_ref()
-          material_holder:write_qword(0x10, laser_material_resource:get_address())
+    end
+    
+    -- Always recreate material resource to ensure it's valid for this scene
+    laser_material_resource = sdk.create_resource("via.render.MeshMaterialResource", "LaserColors/classicRE4LaserMaterial.mdf2")
+    if laser_material_resource then
+      laser_material_resource:add_ref()
+    end
+    
+    if laser_material_resource and laser_material_resource:get_address() ~= 0 then
+      -- Create material holder and apply material using set_Material()
+      local material_holder = sdk.create_instance("via.render.MeshMaterialResourceHolder", true)
+      if material_holder and material_holder:get_address() ~= 0 then
+        material_holder:add_ref()
+        material_holder:write_qword(0x10, laser_material_resource:get_address())
+        if mesh_component:get_address() ~= 0 then
           mesh_component:set_Material(material_holder)
         end
       end
     end
-  end)
+  end
   -- Apply loaded material params immediately after mesh is created
   apply_laser_trail_settings()
   
@@ -684,6 +700,7 @@ re.on_script_reset(function()
   cached_gun_obj = nil
   cached_weapon_id = nil
   cached_laser_sight_obj = nil
+  current_muzzle_joint = nil
   
   -- Reset state variables
   scene_manager = nil
@@ -694,6 +711,8 @@ re.on_script_reset(function()
   
   -- Clear the laser trail game object reference
   laser_trail_gameobject = nil
+  laser_mesh_resource = nil
+  laser_material_resource = nil
 end)
 
 
@@ -772,16 +791,28 @@ if not scene then
   return
 end
 
--- Track when crosshair was last active
-local current_time = os.clock()
-if _G.is_aim and _G.is_reticle_displayed then
-  last_crosshair_active_time = current_time
-end
+-- Simple mode (default): Skip all the grace period logic and just update muzzle data like old version
+-- Advanced mode only when keep_laser_always_on is enabled
+if keep_laser_always_on then
+  -- Track when crosshair was last active (consider always-on option)
+  local current_time = os.clock()
+  local reticle_active_for_tracking = _G.is_aim or (keep_laser_always_on and show_laser_dot)
+  -- If keep-always-on is enabled and toggled on, don't require _G.is_reticle_displayed
+  if reticle_active_for_tracking and ( _G.is_reticle_displayed or (keep_laser_always_on and show_laser_dot) ) then
+    last_crosshair_active_time = current_time
+  end
+  -- In always-on mode, keep the grace timer refreshed every frame to avoid timeout hiding the dot/trail
+  if keep_laser_always_on and show_laser_dot then
+    last_crosshair_active_time = current_time
+    last_laser_trail_active_time = current_time
+  end
 
--- Don't access any components if there's no crosshair/reticle displayed (with 1 second grace period)
-if not _G.is_aim or not _G.is_reticle_displayed then
-  if (current_time - last_crosshair_active_time) > 1.0 then
-    return
+  -- Don't access any components if there's no crosshair/reticle displayed (with 1 second grace period)
+  local reticle_for_components = _G.is_aim or (keep_laser_always_on and show_laser_dot)
+  if not reticle_for_components then
+    if not (keep_laser_always_on and show_laser_dot) and (current_time - last_crosshair_active_time) > 1.0 then
+      return
+    end
   end
 end
 
@@ -992,17 +1023,20 @@ local function update_static_dot_interpolation()
   end
 end
 
-local function update_laser_trail()
--- Update laser trail (now separate function again)  
--- Only show the laser trail if aiming, enabled, and has valid muzzle
--- Hide trail when simple static mode is enabled AND laser is toggled off (showing backup dot)
--- Hide trail when static mode is enabled and there's no new muzzle data
--- Check if laser is enabled for current weapon (default to enabled if not set)
-local weapon_id_str = tostring(current_weapon_id)
-local laser_enabled_for_weapon = weapon_laser_enabled[weapon_id_str] ~= false  -- Default true if nil
+local function update_laser_trail_simple()
+-- SIMPLE MODE: Exact copy of old version behavior with 0.15s grace period at end
 local has_stale_muzzle_data = static_center_dot and (os.clock() - last_crosshair_time) > 0.25
+local should_show = enable_laser_trail and re4.last_muzzle_pos and not is_non_muzzle_weapon and _G.is_aim and not (simple_static_mode and not show_laser_dot) and not has_stale_muzzle_data
 
-if not enable_laser_trail or not re4.last_muzzle_pos or is_non_muzzle_weapon or not _G.is_aim or (simple_static_mode and not show_laser_dot) or has_stale_muzzle_data or not laser_enabled_for_weapon then
+-- Update last active time when trail should be shown
+if should_show then
+  last_laser_trail_active_time = os.clock()
+end
+
+-- Use 0.15-second grace period after stopping aim
+local within_grace_period = (os.clock() - last_laser_trail_active_time) < 0.15
+
+if not should_show and not within_grace_period then
   if laser_trail_gameobject then
     laser_trail_gameobject:set_DrawSelf(false)
   end
@@ -1110,6 +1144,180 @@ pcall(function()
 end)
 end
 
+local function update_laser_trail()
+-- Update laser trail (now separate function again)  
+-- Show laser trail whenever aiming and dot is visible
+-- Check if laser is enabled for current weapon (default to enabled if not set)
+local weapon_id_str = tostring(current_weapon_id)
+local laser_enabled_for_weapon = weapon_laser_enabled[weapon_id_str] ~= false  -- Default true if nil
+
+-- SIMPLE MODE (default): Use exact old version behavior when keep_laser_always_on is off
+if not keep_laser_always_on then
+  update_laser_trail_simple()
+  return
+end
+
+-- ADVANCED MODE: Grace periods, delays, and keep-always-on support
+local weapon_id_str = tostring(current_weapon_id)
+local laser_enabled_for_weapon = weapon_laser_enabled[weapon_id_str] ~= false  -- Default true if nil
+
+-- Show trail if: aiming AND laser is enabled for weapon AND not a non-muzzle weapon
+-- Don't check re4.last_muzzle_pos - let the trail stay as long as we're aiming
+-- Show trail when aiming OR when "keep always on" is enabled and toggled on
+local should_show_trail = ((_G.is_aim) or (keep_laser_always_on and show_laser_dot)) and laser_enabled_for_weapon and not is_non_muzzle_weapon and enable_laser_trail
+
+  -- Also hide if simple static mode with laser toggled off
+  if simple_static_mode and not show_laser_dot then
+    should_show_trail = false
+  end
+
+  -- Track when aiming started
+  if should_show_trail and not was_laser_trail_active_prev then
+    aim_start_time = os.clock()
+  end
+
+  -- Update last active time when trail should be shown
+  if should_show_trail then
+    last_laser_trail_active_time = os.clock()
+  end
+
+  -- Check if laser is explicitly disabled (toggled off) - no grace period for this
+  local laser_explicitly_disabled = not laser_enabled_for_weapon or (simple_static_mode and not show_laser_dot) or not enable_laser_trail
+
+  -- Use 0.25-second grace period for laser trail after aiming (no grace if toggled off)
+  local within_grace_period = (os.clock() - last_laser_trail_active_time) < 0.25 and not laser_explicitly_disabled
+
+  -- Delay showing trail for 0.1 seconds after starting to aim (prevents snap-back)
+  -- Skip delay if keep-always-on mode is active (show immediately when toggled)
+  local aim_delay_elapsed = (keep_laser_always_on and show_laser_dot) or ((os.clock() - aim_start_time) >= 0.1)
+
+  was_laser_trail_active_prev = should_show_trail or within_grace_period
+
+  if not should_show_trail and not within_grace_period then
+    if laser_trail_gameobject then
+      laser_trail_gameobject:set_DrawSelf(false)
+    end
+    return
+  end
+
+  -- Don't show trail until delay has elapsed
+  if should_show_trail and not aim_delay_elapsed then
+    if laser_trail_gameobject then
+      laser_trail_gameobject:set_DrawSelf(false)
+    end
+    return
+  end
+
+-- Always create trail if missing when aiming resumes
+if not laser_trail_gameobject then
+  create_laser_trail()
+end
+
+if not laser_trail_gameobject then
+  return
+end
+
+-- Check if the game object is still valid before accessing it
+if not is_laser_trail_valid() then
+  return
+end
+
+-- Always show the trail when aiming and all conditions are met
+laser_trail_gameobject:set_DrawSelf(true)
+
+local laser_transform = laser_trail_gameobject:get_Transform()
+if not laser_transform then
+  return
+end
+
+-- Use the same intersection and direction as the dot (shared muzzle data)
+pcall(function()
+  local equipped_weapon_id = tostring(current_weapon_id)
+  local offset_tbl = (equipped_weapon_id and laser_origin_offsets and laser_origin_offsets[equipped_weapon_id]) or {x=laser_origin_offset_x, y=laser_origin_offset_y, z=laser_origin_offset_z}
+  local offset_x = offset_tbl.x or 0.0
+  local offset_y = offset_tbl.y or 0.0
+  local offset_z = offset_tbl.z or 0.0
+  local adjusted_muzzle_pos = re4.last_muzzle_pos
+
+  if current_muzzle_joint and current_muzzle_joint:get_address() ~= 0 then
+    local axis_x = current_muzzle_joint:call("get_AxisX")
+    local axis_y = current_muzzle_joint:call("get_AxisY")
+    local axis_z = current_muzzle_joint:call("get_AxisZ")
+    adjusted_muzzle_pos = adjusted_muzzle_pos
+      + (axis_x * offset_x)
+      + (axis_y * offset_y)
+      + (axis_z * offset_z)
+  else
+    adjusted_muzzle_pos = Vector3f.new(
+      re4.last_muzzle_pos.x + offset_x,
+      re4.last_muzzle_pos.y + offset_y,
+      re4.last_muzzle_pos.z + offset_z
+    )
+  end
+
+  -- Calculate endpoint: use same async method as static dot for consistent behavior
+  local start_point = adjusted_muzzle_pos
+  local end_point
+
+  if static_center_dot and _G.is_aim and _G.is_reticle_displayed and (_G.is_active ~= false) then
+    -- For static mode, use the same cached intersection from the static dot's async raycast
+    if cached_static_intersection_point then
+      -- Use the same intersection point that the static dot is using
+      end_point = cached_static_intersection_point
+    else
+      -- Fallback to crosshair position if cached intersection not available yet
+      end_point = re4.crosshair_pos
+    end
+  else
+    -- If keep-always-on is active but player is not aiming, use muzzle forward to project the trail
+    if keep_laser_always_on and show_laser_dot and (not _G.is_aim) then
+      local forward = re4.last_muzzle_forward or re4.last_shoot_dir or re4.last_muzzle_forward
+      if forward then
+        end_point = start_point + (forward:normalized() * 1000.0)
+      else
+        end_point = re4.crosshair_pos - (re4.crosshair_dir * TRAIL_OFFSET)
+      end
+    else
+      -- Use crosshair position for dynamic mode with unified trail offset
+      end_point = re4.crosshair_pos - (re4.crosshair_dir * TRAIL_OFFSET)
+    end
+  end
+
+  -- Apply weapon-specific endpoint offset for laser trail only (does not affect dot)
+  if current_weapon_id == 6102 then
+    -- Distance-based offset for weapon 6102 trail endpoint
+    local distance_to_target = (end_point - start_point):length()
+    local offset_y
+    if distance_to_target > 10.0 then
+      offset_y = -0.05  -- Over 10m
+    elseif distance_to_target > 5.0 then
+      offset_y = -0.0175  -- 5-10m
+    else
+      offset_y = -0.015  -- Under 5m
+    end
+    local trail_offset = Vector3f.new(0, offset_y, 0)
+    end_point = end_point + trail_offset
+  end
+
+  -- Ensure start point doesn't go behind the muzzle
+  local muzzle_to_start = start_point - adjusted_muzzle_pos
+  local forward_projection = muzzle_to_start:dot(re4.crosshair_dir)
+  if forward_projection < 0 then
+    start_point = adjusted_muzzle_pos
+  end
+
+  local distance = (end_point - start_point):length()
+  
+  laser_transform:set_Position(start_point)
+  local beam_direction = (end_point - start_point):normalized()
+  local default_forward = Vector3f.new(0, 0, 1)
+  local rotation_quat = default_forward:to_quat():slerp(beam_direction:to_quat(), 1.0)
+  laser_transform:set_Rotation(rotation_quat)
+  local beam_scale = laser_trail_scale
+  laser_transform:set_LocalScale(Vector3f.new(beam_scale, beam_scale, distance/7.7)) --maybe change mesh size instead of dividing
+end)
+end
+
 re.on_pre_application_entry("LockScene", function()
 -- Determine aiming state (is_aim) using CharacterContext, similar to reference
 pcall(function()
@@ -1145,6 +1353,11 @@ pcall(function()
   end
 end)
 
+-- Force reticle visibility flag when always-on laser is enabled so the dot doesn't auto-hide
+if keep_laser_always_on and show_laser_dot then
+  _G.is_reticle_displayed = true
+end
+
 local force_classic = (_G.force_classic_re4_style == true)
 local fp_active = (rawget(_G, "standalone_first_person_active") == true)
 
@@ -1176,7 +1389,7 @@ if force_disable_shoulder then
   shoulder_restore_frames = 0
   if not disable_shoulder_corrector then
     disable_shoulder_corrector = true
-    -- No need to set hasRunInitially = false - shoulder corrector is independent
+    hasRunInitially = false
   end
 else
   -- When iron sight or first person mode is toggled off, always uncheck Disable Shoulder Corrector
@@ -1223,7 +1436,7 @@ if not force_disable_shoulder and pending_shoulder_restore ~= nil then
   else
     if disable_shoulder_corrector ~= pending_shoulder_restore then
       disable_shoulder_corrector = pending_shoulder_restore
-      -- No need to set hasRunInitially = false - shoulder corrector is independent
+      hasRunInitially = false
     end
     pending_shoulder_restore = nil
   end
@@ -1242,6 +1455,10 @@ if (os.clock() - last_crosshair_time) < 1.0 then
   update_laser_trail() -- Keep trail and muzzle data in sync
 else
   update_muzzle_and_laser_data()
+  -- Only update trail when data is stale if in advanced mode (keep_laser_always_on)
+  if keep_laser_always_on then
+    update_laser_trail() -- Also update trail when data is stale to keep visibility in sync with dot
+  end
 
   -- Even when crosshair data is stale, still update muzzle position and laser trail
   pcall(function()
@@ -1284,12 +1501,26 @@ end
 
 -- Update the re.on_pre_gui_draw_element function to respect show_laser_dot
 re.on_pre_gui_draw_element(function(element, context)
-  -- Don't access any components if there's no crosshair/reticle displayed (with 1 second grace period)
-  if not _G.is_aim or not _G.is_reticle_displayed then
-    if (os.clock() - last_crosshair_active_time) > 1.0 then
+  -- Simple mode (default): Use 0.15s grace period matching the trail
+  if not keep_laser_always_on then
+    local within_grace_period = (os.clock() - last_laser_trail_active_time) < 0.15
+    if not _G.is_aim and not within_grace_period then
       return true
     end
+  else
+    -- Don't access any components if there's no crosshair/reticle displayed (with 1 second grace period)
+    local reticle_active_for_gui = _G.is_aim or (keep_laser_always_on and show_laser_dot)
+    -- Allow always-on mode to bypass the CharacterContext "reticle displayed" flag
+    if not reticle_active_for_gui or (not _G.is_reticle_displayed and not (keep_laser_always_on and show_laser_dot)) then
+      if not (keep_laser_always_on and show_laser_dot) and (os.clock() - last_crosshair_active_time) > 1.0 then
+        return true
+      end
+    end
   end
+  
+  -- Check if we're within the 0.1 second aim delay (sync dot with trail)
+  -- Skip delay in simple mode (default) or when keep-always-on mode is active and toggled on
+  local aim_delay_elapsed = (not keep_laser_always_on) or (keep_laser_always_on and show_laser_dot) or ((os.clock() - aim_start_time) >= 0.1)
   
   local game_object = element:call("get_GameObject")
   local name = game_object and game_object:call("get_Name")
@@ -1368,10 +1599,16 @@ if reticle_names[name] then
     if current_color then
       -- Only apply color and alpha changes for muzzle weapons (guns)
       if not is_non_muzzle_weapon then
+        -- Hide dot during aim delay (to sync with trail appearing)
+        if _G.is_aim and not aim_delay_elapsed then
+          current_color.x = 0
+          current_color.y = 0
+          current_color.z = 0
+          current_color.w = 0.0  -- Hidden during aim delay
+          type_panel:call("set_ColorScale", current_color)
         -- Handle dot visibility based on hotkey state and weapon laser settings
         -- Note: IronSight/FP+Preset hiding is already handled by early return above
-        
-        if not laser_enabled_for_weapon then
+        elseif not laser_enabled_for_weapon then
           -- Weapon has laser disabled in settings: show static colored dot with separate color
           current_color.x = static_reticle_color_array[1] or 1.0
           current_color.y = static_reticle_color_array[2] or 1.0
@@ -1832,6 +2069,10 @@ local function resetValues()
   scene_manager = nil
   scene = nil
   hasRunInitially = false
+  current_muzzle_joint = nil
+  cached_gun_obj = nil
+  cached_weapon_id = nil
+  cached_laser_sight_obj = nil
   destroy_laser_trail()  -- Clean up laser trail when resetting
 end
 
@@ -1980,6 +2221,16 @@ re.on_draw_ui(function()
         save_config()
     end
     
+    -- Keep Laser Always On option: when checked, laser remains active until toggled off
+    local keep_always_changed = false
+    keep_always_changed, keep_laser_always_on = imgui.checkbox("Keep laser always on", keep_laser_always_on)
+    if imgui.is_item_hovered() then
+      imgui.set_tooltip("When enabled, the laser will remain active regardless of aim state until you toggle it off")
+    end
+    if keep_always_changed then
+      save_config()
+    end
+
     imgui.end_rect(1)
   
   imgui.spacing()
@@ -2256,31 +2507,42 @@ re.on_draw_ui(function()
   end
   
   -- Laser Beam Material Editor (simplified)
-  if laser_trail_gameobject then
+  if is_laser_trail_valid() then
     local mesh_component = laser_trail_gameobject:call("getComponent(System.Type)", sdk.typeof("via.render.Mesh"))
-    if mesh_component and mesh_component.get_MaterialNum and mesh_component.getMaterialName and mesh_component.getMaterialVariableNum and mesh_component.getMaterialVariableName and mesh_component.getMaterialVariableType and mesh_component.getMaterialFloat and mesh_component.getMaterialFloat4 and mesh_component.setMaterialFloat and mesh_component.setMaterialFloat4 then
-      local matCount = mesh_component:get_MaterialNum()
+    
+    if mesh_component then
+      local has_methods = pcall(function() 
+        return mesh_component.get_MaterialNum ~= nil 
+      end)
+      
+      if has_methods then
+        local matCount = mesh_component:get_MaterialNum()
      
       _G.laser_mat_params = _G.laser_mat_params or {}
       _G.laser_mat_params_defaults = _G.laser_mat_params_defaults or {}
+      
+      -- Set hardcoded defaults for laser beam material parameters
+      if not _G.laser_mat_params_defaults["wp4000_00_Laserbeam"] then
+        _G.laser_mat_params_defaults["wp4000_00_Laserbeam"] = {
+          AlphaRate = 0.009999999776482582,
+          EmissiveColor = {0.019999999552965164, 0.20000000298023224, 0.6000000238418579, 1.0},
+          EmissiveIntensity = 16.100000381469727,
+          GradationRate = 1.2100000381469727,
+          SmokeContrast_Add = 0.0,
+          SmokeContrast_Pow = 5.0,
+          SmokeDetailScale = 7.679999828338623,
+          SmokeDetailSpeed = 4.769999980926514
+        }
+      end
+      
       for j = 0, matCount - 1 do
         local matName = mesh_component:getMaterialName(j)
         local matParam = mesh_component:getMaterialVariableNum(j)
         if not _G.laser_mat_params[matName] then _G.laser_mat_params[matName] = {} end
-        if not _G.laser_mat_params_defaults[matName] then _G.laser_mat_params_defaults[matName] = {} end
         
         for k = 0, matParam - 1 do
           local paramName = mesh_component:getMaterialVariableName(j, k)
           local paramType = mesh_component:getMaterialVariableType(j, k)
-          
-          if _G.laser_mat_params_defaults[matName][paramName] == nil then
-            if paramType == 1 then
-              _G.laser_mat_params_defaults[matName][paramName] = mesh_component:getMaterialFloat(j, k)
-            elseif paramType == 4 then
-              local curVal = mesh_component:getMaterialFloat4(j, k)
-              _G.laser_mat_params_defaults[matName][paramName] = {curVal.x, curVal.y, curVal.z, curVal.w}
-            end
-          end
           
           if paramType == 1 then -- float
             local curVal = mesh_component:getMaterialFloat(j, k)
@@ -2327,10 +2589,11 @@ re.on_draw_ui(function()
           end
         end
       end
-    else
-      imgui.text(" Laser trail mesh/material not available.")
+      end
     end
-  else
+  end
+  
+  if not laser_trail_gameobject then
     imgui.text(" Laser trail not active.")
   end
   imgui.end_rect(1)
@@ -2435,7 +2698,7 @@ re.on_draw_ui(function()
     laser_beam_color_array = {1.0, 0.0, 0.0, 1.0}
     apply_beam_color(laser_beam_color_array)
     
-    if laser_trail_gameobject then
+    if is_laser_trail_valid() then
       local mesh_component = laser_trail_gameobject:call("getComponent(System.Type)", sdk.typeof("via.render.Mesh"))
       if mesh_component then
         local matCount = mesh_component:get_MaterialNum()
@@ -2495,7 +2758,7 @@ re.on_draw_ui(function()
       end
       
       -- Reset beam material parameters if laser trail exists (before clearing defaults)
-      if laser_trail_gameobject then
+      if is_laser_trail_valid() then
         local mesh_component = laser_trail_gameobject:call("getComponent(System.Type)", sdk.typeof("via.render.Mesh"))
         if mesh_component and _G.laser_mat_params_defaults then
           local matCount = mesh_component:get_MaterialNum()
@@ -2531,7 +2794,7 @@ re.on_draw_ui(function()
   imgui.spacing()
   
   -- Weapon Laser Enable Settings
-  if imgui.tree_node("Weapon Laser Settings") then
+  if imgui.tree_node("Weapon-Specific Laser Enable/Disable") then
     imgui.begin_rect()
     imgui.text_colored(" Select weapons to show laser trail:", 0xFFFFFFAA)
     imgui.text_colored(" (Unchecked weapons will only show dot reticle)", 0xFFAAAA00)
