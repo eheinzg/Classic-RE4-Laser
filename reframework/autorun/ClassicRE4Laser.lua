@@ -67,6 +67,9 @@ _G.classic_re4_laser_weapon_disabled = false
 local scene = nil
 local gun_obj = nil
 
+-- Store reference for cleanup on script reset
+local laser_trail_table = {}
+
 -- Helper to set global spawn ownership based on current weapon and mode
 local function update_spawn_flag()
   if type(weapon_laser_enabled) ~= "table" then
@@ -596,6 +599,9 @@ local function create_laser_trail()
   if not laser_trail_gameobject then
     return
   end
+  
+  -- Store in table for cleanup on script reset
+  laser_trail_table["trail"] = laser_trail_gameobject
 
   -- Create mesh component and load resources
   pcall(function()
@@ -653,6 +659,42 @@ if laser_trail_gameobject then
   laser_trail_gameobject = nil
 end
 end
+
+-- Clean up laser trail when scripts are reset (prevents frozen leftover trails)
+re.on_script_reset(function()
+  -- Destroy laser trail table reference
+  if laser_trail_table["trail"] then
+    pcall(function()
+      laser_trail_table["trail"]:call("destroy", laser_trail_table["trail"])
+    end)
+    laser_trail_table["trail"] = nil
+  end
+  
+  -- Also try the direct reference
+  destroy_laser_trail()
+  
+  -- Reset raycast results
+  crosshair_bullet_ray_result = nil
+  crosshair_attack_ray_result = nil
+  static_attack_ray_result = nil
+  static_bullet_ray_result = nil
+  
+  -- Reset cached objects
+  cached_pl_head = nil
+  cached_gun_obj = nil
+  cached_weapon_id = nil
+  cached_laser_sight_obj = nil
+  
+  -- Reset state variables
+  scene_manager = nil
+  scene = nil
+  hasRunInitially = false
+  _G.is_aim = false
+  _G.is_reticle_displayed = false
+  
+  -- Clear the laser trail game object reference
+  laser_trail_gameobject = nil
+end)
 
 
 local function update_crosshair_world_pos(start_pos, end_pos)
