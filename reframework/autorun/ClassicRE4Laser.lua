@@ -122,6 +122,7 @@ local weapon_names = {
   [4002] = "Red9",
   [4003] = "Blacktail",
   [4004] = "Matilda",
+  [4005] = "Minecart Handgun",
   [4100] = "W-870",
   [4101] = "Riot Gun",
   [4102] = "Striker",
@@ -157,7 +158,7 @@ local weapon_names = {
 
 -- Weapon categories for organized display
 local weapon_categories = {
-    {name = "Handguns", ids = {4000, 4001, 4002, 4003, 4004, 6000, 6001, 6112, 6300}},
+    {name = "Handguns", ids = {4000, 4001, 4002, 4003, 4004, 4005, 6000, 6001, 6112, 6300}},
     {name = "Shotguns", ids = {4100, 4101, 4102, 6100, 6101, 6102}},
     {name = "SMGs", ids = {4200, 4201, 4202, 6103, 6104}},
     {name = "Rifles", ids = {4400, 4401, 4402, 6105, 6114}},
@@ -353,9 +354,19 @@ local function manage_hooks(force_check)
   local laser_disabled_for_weapon = weapon_laser_enabled[weapon_id_str] == false
   local laser_enabled_for_weapon = weapon_laser_enabled[weapon_id_str] ~= false  -- Default true if nil
   
+  -- Check if IronSight + Preset mode is active (needs hook for muzzle spawns)
+  local is_ironsight_active = (_G.force_classic_re4_style == true)
+  local fp_active = (rawget(_G, "standalone_first_person_active") == true)
+  local preset_a_active = (rawget(_G, "custom_aim_preset_a_active") == true)
+  local preset_b_active = (rawget(_G, "custom_aim_preset_b_active") == true)
+  local preset_c_active = (rawget(_G, "custom_aim_preset_c_active") == true)
+  local preset_d_active = (rawget(_G, "custom_aim_preset_d_active") == true)
+  local fp_preset_active = fp_active and (preset_a_active or preset_b_active or preset_c_active or preset_d_active)
+  local ironsight_preset_override = (is_ironsight_active or fp_preset_active) and laser_disabled_for_weapon
+  
   -- Don't apply hook logic if static center dot (RE4 Remake style) is enabled
-  -- OR if laser is disabled for current weapon (use RE4 Remake style bullet spawns)
-  if static_center_dot or laser_disabled_for_weapon then
+  -- OR if laser is disabled for current weapon WITHOUT IronSight/Preset override
+  if static_center_dot or (laser_disabled_for_weapon and not ironsight_preset_override) then
     -- If hooks are currently active but static/disabled mode is enabled, unhook them
     if is_hooks_active then
       unhook_request_fire()
@@ -364,7 +375,8 @@ local function manage_hooks(force_check)
     return
   end
   
-  local should_hook = is_hold_variation and current_weapon_id == 4600
+  -- Hook if: Bolt Thrower hold variation OR IronSight/Preset with laser-disabled weapon
+  local should_hook = (is_hold_variation and current_weapon_id == 4600) or ironsight_preset_override
   
   -- Only do something if the conditions have changed OR if forced
   if should_hook ~= last_hook_conditions or force_check then
@@ -1058,7 +1070,9 @@ local fp_active = (rawget(_G, "standalone_first_person_active") == true)
 -- When using first person mode with preset A or B active, also force Classic RE4 Style
 local preset_a_active = (rawget(_G, "custom_aim_preset_a_active") == true)
 local preset_b_active = (rawget(_G, "custom_aim_preset_b_active") == true)
-local fp_preset_ab_force_classic = fp_active and (preset_a_active or preset_b_active)
+local preset_c_active = (rawget(_G, "custom_aim_preset_c_active") == true)
+local preset_d_active = (rawget(_G, "custom_aim_preset_d_active") == true)
+local fp_preset_ab_force_classic = fp_active and (preset_a_active or preset_b_active or preset_c_active or preset_d_active)
 
 local force_disable_shoulder = force_classic or fp_active
 
@@ -1083,8 +1097,9 @@ end
 local should_force_classic = force_classic or fp_preset_ab_force_classic
 if should_force_classic then
   if not force_classic_re4_prev then
-    -- Just entered force_classic - store current state
+    -- Just entered force_classic - store current state and update hooks for IronSight/Preset override
     stored_static_center_dot = static_center_dot
+    manage_hooks(true)  -- Check if we need to hook for laser-disabled weapons
   end
   if static_center_dot then
     static_center_dot = false
@@ -1095,7 +1110,8 @@ if should_force_classic then
 else
   -- force_classic is false - check if we need to restore
   if force_classic_re4_prev then
-    -- Just exited force_classic - restore previous state
+    -- Just exited force_classic - restore previous state and update hooks
+    manage_hooks(true)  -- Check if we need to unhook for laser-disabled weapons
     if stored_static_center_dot ~= nil and static_center_dot ~= stored_static_center_dot then
       static_center_dot = stored_static_center_dot
       update_spawn_flag()
@@ -1180,6 +1196,22 @@ re.on_pre_gui_draw_element(function(element, context)
   local weapon_id_str = tostring(current_weapon_id)
   local laser_enabled_for_weapon = weapon_laser_enabled[weapon_id_str] ~= false
   
+  -- Hide dot when laser disabled AND IronSight/FP+Preset is active (early return for performance)
+  if not laser_enabled_for_weapon and not is_non_muzzle_weapon then
+    local is_ironsight_active = (_G.force_classic_re4_style == true)
+    local fp_active = (rawget(_G, "standalone_first_person_active") == true)
+    local preset_a_active = (rawget(_G, "custom_aim_preset_a_active") == true)
+    local preset_b_active = (rawget(_G, "custom_aim_preset_b_active") == true)
+    local preset_c_active = (rawget(_G, "custom_aim_preset_c_active") == true)
+    local preset_d_active = (rawget(_G, "custom_aim_preset_d_active") == true)
+    local fp_preset_active = fp_active and (preset_a_active or preset_b_active or preset_c_active or preset_d_active)
+    if is_ironsight_active or fp_preset_active then
+      if reticle_names[name] then
+        return false -- Hide dot when IronSight/FP+Preset overrides laser-disabled weapon
+      end
+    end
+  end
+  
   -- Handle reticle visibility based on simple static mode functionality
   -- Note: When laser is disabled for a weapon in settings, we still show the dot (only hide trail)
   if not show_laser_dot and enable_laser_trail and laser_enabled_for_weapon and not (simple_static_mode and not show_laser_dot) then
@@ -1227,8 +1259,9 @@ if reticle_names[name] then
     if current_color then
       -- Only apply color and alpha changes for muzzle weapons (guns)
       if not is_non_muzzle_weapon then
-        -- Use laser_color_array directly (already in 0-1 range)
         -- Handle dot visibility based on hotkey state and weapon laser settings
+        -- Note: IronSight/FP+Preset hiding is already handled by early return above
+        
         if not laser_enabled_for_weapon then
           -- Weapon has laser disabled in settings: show static colored dot with separate color
           current_color.x = static_reticle_color_array[1] or 1.0
@@ -1610,12 +1643,12 @@ local function updateReticles()
   local function processWeaponData(weaponData)
     local weaponID = weaponData:get_field("_WeaponID")
     
-        -- Check if this weapon has laser disabled
+    -- Check if this weapon has laser disabled
     local weapon_id_str = tostring(weaponID)
     local laser_disabled_for_this_weapon = weapon_laser_enabled and weapon_laser_enabled[weapon_id_str] == false
     
     -- Set follow target: 0 = camera spawn (RE4 Remake), 1 = muzzle spawn (Classic)
-    -- Force camera spawn (0) if laser is disabled for this weapon OR if static_center_dot is enabled
+    -- IronSight.lua will override this when active
     if laser_disabled_for_this_weapon or static_center_dot then
       weaponData:set_field("_GenerateFollowTarget", 0)
     else
@@ -1802,16 +1835,24 @@ re.on_draw_ui(function()
     
     -- Quick Options
     imgui.begin_rect()
-    local simple_static_changed = false
-    simple_static_changed, simple_static_mode = imgui.checkbox("Enable dot reticle", simple_static_mode)
-    if imgui.is_item_hovered() then
-        imgui.set_tooltip("Enable completely static dot reticle when laser is off")
-    end
-    if simple_static_changed then
-        save_config()
+    
+    -- Check if current weapon has laser disabled (hide Enable Dot Reticle option since dot is always shown)
+    local weapon_id_str = current_weapon_id and tostring(current_weapon_id) or "unknown"
+    local laser_disabled_for_current_weapon = weapon_laser_enabled[weapon_id_str] == false
+    
+    if not laser_disabled_for_current_weapon then
+      local simple_static_changed = false
+      simple_static_changed, simple_static_mode = imgui.checkbox("Enable dot reticle", simple_static_mode)
+      if imgui.is_item_hovered() then
+          imgui.set_tooltip("Enable completely static dot reticle when laser is off")
+      end
+      if simple_static_changed then
+          save_config()
+      end
+      
+      imgui.same_line()
     end
     
-    imgui.same_line()
     corrector_changed, disable_shoulder_corrector = imgui.checkbox("Disable Shoulder Corrector", disable_shoulder_corrector)
     if imgui.is_item_hovered() then
         imgui.set_tooltip("Disable weapon shoulder correction (removes auto centering of the arms and laser dot when aiming for Classic RE4 Laser. Has no effect on laser positioning for RE4 Remake Style)")
