@@ -61,9 +61,33 @@ global_intersection_point = nil
 -- Global flag for other mods to check if Classic RE4 Style mode is active
 -- When true, bullet spawn is handled by ClassicRE4Laser (not IronSight.lua)
 _G.classic_re4_laser_bullet_spawn_active = false
+-- New flag: true when weapon has laser unchecked (forces RE4 Remake spawn, distinct status)
+_G.classic_re4_laser_weapon_disabled = false
 
 local scene = nil
 local gun_obj = nil
+
+-- Helper to set global spawn ownership based on current weapon and mode
+local function update_spawn_flag()
+  if type(weapon_laser_enabled) ~= "table" then
+    weapon_laser_enabled = {}
+  end
+  local weapon_id_str = current_weapon_id and tostring(current_weapon_id) or "unknown"
+  local laser_disabled_for_weapon = weapon_laser_enabled[weapon_id_str] == false
+  
+  -- Set the weapon-disabled flag for other code to detect this distinct state
+  _G.classic_re4_laser_weapon_disabled = laser_disabled_for_weapon
+  
+  -- If weapon is explicitly disabled, force RE4 Remake (camera) spawn regardless of mode
+  if laser_disabled_for_weapon then
+    _G.classic_re4_laser_bullet_spawn_active = false
+    return
+  end
+
+  local laser_enabled_for_weapon = weapon_laser_enabled[weapon_id_str] ~= false  -- default true when nil
+  -- true  => Classic (muzzle) owns bullet spawn; false => Remake (camera) spawn
+  _G.classic_re4_laser_bullet_spawn_active = (not static_center_dot) and laser_enabled_for_weapon
+end
 
 -- Global variables for laser trail offset calculations
 local current_weapon_id = nil
@@ -324,9 +348,15 @@ end
 
 -- Function to manage hooks based on conditions (only when conditions change)
 local function manage_hooks(force_check)
+  -- Check if laser is enabled for current weapon
+  local weapon_id_str = tostring(current_weapon_id)
+  local laser_disabled_for_weapon = weapon_laser_enabled[weapon_id_str] == false
+  local laser_enabled_for_weapon = weapon_laser_enabled[weapon_id_str] ~= false  -- Default true if nil
+  
   -- Don't apply hook logic if static center dot (RE4 Remake style) is enabled
-  if static_center_dot then
-    -- If hooks are currently active but static mode is enabled, unhook them
+  -- OR if laser is disabled for current weapon (use RE4 Remake style bullet spawns)
+  if static_center_dot or laser_disabled_for_weapon then
+    -- If hooks are currently active but static/disabled mode is enabled, unhook them
     if is_hooks_active then
       unhook_request_fire()
     end
@@ -496,8 +526,8 @@ local function load_config()
     weapon_laser_enabled = data.weapon_laser_enabled
   end
   
-  -- Update global flag for other mods to know Classic RE4 Style bullet spawn is active
-  _G.classic_re4_laser_bullet_spawn_active = (not static_center_dot)
+  -- Update global flag for other mods to know Classic vs Remake bullet spawn per weapon
+  update_spawn_flag()
   
   apply_laser_trail_settings()
   return true
@@ -664,17 +694,6 @@ end
 
 -- Use cached objects to avoid expensive findGameObject calls
 local current_time = os.clock()
-
--- Skip processing when shooting is not enabled (cutscenes, menus, etc.)
-if not _G.is_aim then
-  -- Clear caches to avoid stale object references
-  cached_pl_head = nil
-  cached_gun_obj = nil
-  cached_weapon_id = nil
-  cached_laser_sight_obj = nil
-  return
-end
-
 if not cached_pl_head or (current_time - cache_refresh_time) > cache_refresh_interval then
   cached_pl_head = scene:call("findGameObject(System.String)", "ch0a0z0_head")
   if not cached_pl_head then
@@ -885,11 +904,10 @@ local function update_laser_trail()
 -- Only show the laser trail if aiming, enabled, and has valid muzzle
 -- Hide trail when simple static mode is enabled AND laser is toggled off (showing backup dot)
 -- Hide trail when static mode is enabled and there's no new muzzle data
-local has_stale_muzzle_data = static_center_dot and (os.clock() - last_crosshair_time) > 0.25
-
 -- Check if laser is enabled for current weapon (default to enabled if not set)
 local weapon_id_str = tostring(current_weapon_id)
 local laser_enabled_for_weapon = weapon_laser_enabled[weapon_id_str] ~= false  -- Default true if nil
+local has_stale_muzzle_data = static_center_dot and (os.clock() - last_crosshair_time) > 0.25
 
 if not enable_laser_trail or not re4.last_muzzle_pos or is_non_muzzle_weapon or not _G.is_aim or (simple_static_mode and not show_laser_dot) or has_stale_muzzle_data or not laser_enabled_for_weapon then
   if laser_trail_gameobject then
@@ -1070,7 +1088,7 @@ if should_force_classic then
   end
   if static_center_dot then
     static_center_dot = false
-    _G.classic_re4_laser_bullet_spawn_active = true  -- Classic RE4 Style handles bullet spawn
+    update_spawn_flag()
     hasRunInitially = false
     manage_hooks(true)
   end
@@ -1080,7 +1098,7 @@ else
     -- Just exited force_classic - restore previous state
     if stored_static_center_dot ~= nil and static_center_dot ~= stored_static_center_dot then
       static_center_dot = stored_static_center_dot
-      _G.classic_re4_laser_bullet_spawn_active = (not static_center_dot)  -- Update based on restored state
+      update_spawn_flag()
       hasRunInitially = false
       manage_hooks(true)
     end
@@ -1280,7 +1298,6 @@ if reticle_names[name] then
   end
   
   -- Handle positioning: prioritize simple static mode when laser is off, then static center vs dynamic
-  -- Also treat weapons with laser disabled in settings like simple_static_mode (static dot only)
   if (simple_static_mode and not show_laser_dot) or not laser_enabled_for_weapon then
     -- Simple static mode with laser OFF or weapon laser disabled: use basic game positioning for static dot
     view:call("set_ViewType", 0) -- Use game's default view type
@@ -1294,7 +1311,8 @@ if reticle_names[name] then
     view:call("set_Detonemap", true)
     view:call("set_DepthTest", true)
   elseif static_center_dot and _G.is_aim and (_G.is_active) then
-    -- Static center positioning - use pre-computed cached intersection from update_static_dot_interpolation()
+    -- Static center positioning (RE4 Remake Style)
+    -- Use pre-computed cached intersection from update_static_dot_interpolation()
     if cached_static_intersection_point and re4.crosshair_dir then
       view:call("set_ViewType", 1) -- world space
       if is_non_muzzle_weapon then
@@ -1592,8 +1610,17 @@ local function updateReticles()
   local function processWeaponData(weaponData)
     local weaponID = weaponData:get_field("_WeaponID")
     
-    -- Set follow target based on static center dot setting
-    weaponData:set_field("_GenerateFollowTarget", static_center_dot and 0 or 1)
+        -- Check if this weapon has laser disabled
+    local weapon_id_str = tostring(weaponID)
+    local laser_disabled_for_this_weapon = weapon_laser_enabled and weapon_laser_enabled[weapon_id_str] == false
+    
+    -- Set follow target: 0 = camera spawn (RE4 Remake), 1 = muzzle spawn (Classic)
+    -- Force camera spawn (0) if laser is disabled for this weapon OR if static_center_dot is enabled
+    if laser_disabled_for_this_weapon or static_center_dot then
+      weaponData:set_field("_GenerateFollowTarget", 0)
+    else
+      weaponData:set_field("_GenerateFollowTarget", 1)
+    end
 
     -- Handle handshake parameters
     local handshakeParamtable = weaponData:get_field("_HandShakeParam")
@@ -1708,7 +1735,13 @@ re.on_draw_ui(function()
     -- Laser Style Selection
     imgui.text_colored(" Laser Behavior:", 0xFFFFFFAA)
     imgui.same_line()
-    if static_center_dot then
+    -- Check if current weapon has laser disabled (takes priority over style)
+    -- Compute directly here to ensure real-time accuracy
+    local weapon_id_str = current_weapon_id and tostring(current_weapon_id) or "unknown"
+    local laser_disabled_for_current_weapon = weapon_laser_enabled[weapon_id_str] == false
+    if laser_disabled_for_current_weapon then
+        imgui.text_colored("Laser Disabled (Camera Spawn)", 0xFFFF6600)
+    elseif static_center_dot then
         imgui.text_colored("RE4 Remake Style", 0xAA0000FF)
     else
         imgui.text_colored("Classic RE4 Style", 0xAA0000FF)
@@ -1754,13 +1787,13 @@ re.on_draw_ui(function()
     -- Handle button presses
     if classic_pressed and static_center_dot then
         static_center_dot = false
-        _G.classic_re4_laser_bullet_spawn_active = true  -- Classic RE4 Style handles bullet spawn
+      update_spawn_flag()
         save_config()
         hasRunInitially = false
         manage_hooks(true)  -- Force check hooks when switching to dynamic mode
     elseif remake_pressed and not static_center_dot then
         static_center_dot = true
-        _G.classic_re4_laser_bullet_spawn_active = false  -- RE4 Remake Style - let other mods handle bullet spawn
+      update_spawn_flag()
         dot_scale = 0.85
         save_config()
         hasRunInitially = false
@@ -2235,7 +2268,7 @@ re.on_draw_ui(function()
       knife_dot_scale = 1.0
       crosshair_saturation = 20.0
       static_center_dot = false
-      _G.classic_re4_laser_bullet_spawn_active = true  -- Classic RE4 Style handles bullet spawn
+      update_spawn_flag()
       simple_static_mode = false
       disable_shoulder_corrector = false
       hide_dot_when_no_muzzle = false
@@ -2299,7 +2332,7 @@ re.on_draw_ui(function()
       laser_color_array = {1.0, 0.0, 0.0, 1.0}
       crosshair_saturation = 20.0
       static_center_dot = false
-      _G.classic_re4_laser_bullet_spawn_active = true  -- Classic RE4 Style handles bullet spawn
+      update_spawn_flag()
       static_lerp_speed = 50.0
       simple_static_mode = false
       enable_laser_trail = true
@@ -2362,6 +2395,8 @@ re.on_draw_ui(function()
         end
       end
       save_config()
+      hasRunInitially = false  -- Force re-run of processWeaponData to update _GenerateFollowTarget
+      manage_hooks(true)
     end
     imgui.same_line()
     if imgui.button("Disable All") then
@@ -2371,6 +2406,8 @@ re.on_draw_ui(function()
         end
       end
       save_config()
+      hasRunInitially = false  -- Force re-run of processWeaponData to update _GenerateFollowTarget
+      manage_hooks(true)
     end
     
     imgui.spacing()
@@ -2394,6 +2431,11 @@ re.on_draw_ui(function()
       if changed then
         weapon_laser_enabled[id_str] = new_val
         save_config()
+        hasRunInitially = false  -- Force re-run of processWeaponData to update _GenerateFollowTarget
+        if id == current_weapon_id then
+          -- If we toggled the weapon we're holding, immediately adjust hook/spawn mode
+          manage_hooks(true)
+        end
       end
     end
     
