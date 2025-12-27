@@ -167,7 +167,9 @@ local weapon_categories = {
 }
 
 -- Per-weapon laser trail enable (default all enabled)
-local weapon_laser_enabled = {}
+local weapon_laser_enabled = {
+  ["4005"] = false  -- Minecart Handgun - laser disabled by default
+}
 
 -- Persistent color arrays for imgui.color_edit4
 local laser_beam_color_array = {1.0, 0.0, 0.0, 1.0}  -- RGBA values for laser beam (0.0-1.0)
@@ -189,6 +191,7 @@ local force_classic_re4_prev = false  -- Track previous force state to restore p
 local any_preset_active_prev = false  -- Track previous preset state to update hooks when presets change
 local iron_sight_active_prev = false  -- Track iron sight active state (aiming) to update hooks
 local force_disable_shoulder_prev = false  -- Track previous force disable state (IronSight or FP mode)
+local last_crosshair_active_time = 0  -- Track when crosshair was last active for grace period
 local stored_disable_shoulder_corrector = nil  -- Cache shoulder corrector preference across forced states
 local SHOULDER_RESTORE_DELAY_FRAMES = 30 -- Frames to wait before restoring shoulder corrector
 local shoulder_restore_frames = 0
@@ -387,8 +390,6 @@ local function manage_hooks(force_check)
   -- Hook only when IronSight is active AND a preset is active AND laser is disabled for weapon
   local ironsight_preset_override = is_ironsight_active and any_preset_active and laser_disabled_for_weapon
   
-  log.info("[ClassicRE4Laser] manage_hooks: ironsight=" .. tostring(is_ironsight_active) .. " preset=" .. tostring(any_preset_active) .. " laser_disabled=" .. tostring(laser_disabled_for_weapon) .. " override=" .. tostring(ironsight_preset_override) .. " static_dot=" .. tostring(static_center_dot))
-  
   -- Don't apply hook logic if static center dot (RE4 Remake style) is enabled
   -- OR if laser is disabled for current weapon WITHOUT IronSight+Preset override
   if static_center_dot or (laser_disabled_for_weapon and not ironsight_preset_override) then
@@ -403,15 +404,11 @@ local function manage_hooks(force_check)
   -- Hook if: Bolt Thrower hold variation OR IronSight+Preset with laser-disabled weapon
   local should_hook = (is_hold_variation and current_weapon_id == 4600) or ironsight_preset_override
   
-  log.info("[ClassicRE4Laser] manage_hooks: should_hook=" .. tostring(should_hook) .. " is_hooks_active=" .. tostring(is_hooks_active))
-  
   -- Only do something if the conditions have changed OR if forced
   if should_hook ~= last_hook_conditions or force_check then
     if should_hook and not is_hooks_active then
-      log.info("[ClassicRE4Laser] HOOKING requestFire")
       hook_request_fire()
     elseif not should_hook and is_hooks_active then
-      log.info("[ClassicRE4Laser] UNHOOKING requestFire")
       unhook_request_fire()
     end
     last_hook_conditions = should_hook
@@ -731,6 +728,19 @@ end
 local function update_muzzle_and_laser_data()
 if not scene then
   return
+end
+
+-- Track when crosshair was last active
+local current_time = os.clock()
+if _G.is_aim and _G.is_reticle_displayed then
+  last_crosshair_active_time = current_time
+end
+
+-- Don't access any components if there's no crosshair/reticle displayed (with 1 second grace period)
+if not _G.is_aim or not _G.is_reticle_displayed then
+  if (current_time - last_crosshair_active_time) > 1.0 then
+    return
+  end
 end
 
 -- Use cached objects to avoid expensive findGameObject calls
@@ -1232,6 +1242,13 @@ end
 
 -- Update the re.on_pre_gui_draw_element function to respect show_laser_dot
 re.on_pre_gui_draw_element(function(element, context)
+  -- Don't access any components if there's no crosshair/reticle displayed (with 1 second grace period)
+  if not _G.is_aim or not _G.is_reticle_displayed then
+    if (os.clock() - last_crosshair_active_time) > 1.0 then
+      return true
+    end
+  end
+  
   local game_object = element:call("get_GameObject")
   local name = game_object and game_object:call("get_Name")
   
