@@ -186,6 +186,8 @@ local static_attack_ray_result = nil  -- Persistent ray result for attack layer
 local static_bullet_ray_result = nil  -- Persistent ray result for bullet layer
 local stored_static_center_dot = nil  -- Cache user preference when forced overrides run
 local force_classic_re4_prev = false  -- Track previous force state to restore preference
+local any_preset_active_prev = false  -- Track previous preset state to update hooks when presets change
+local iron_sight_active_prev = false  -- Track iron sight active state (aiming) to update hooks
 local force_disable_shoulder_prev = false  -- Track previous force disable state (IronSight or FP mode)
 local stored_disable_shoulder_corrector = nil  -- Cache shoulder corrector preference across forced states
 local SHOULDER_RESTORE_DELAY_FRAMES = 30 -- Frames to wait before restoring shoulder corrector
@@ -280,6 +282,25 @@ local last_hook_conditions = false -- Track previous state to detect changes
 
 -- Weapon firing hook functions for hold variation correction
 local function on_pre_request_fire(args)
+  -- Only modify bullet spawn when conditions are met:
+  -- 1. Bolt Thrower hold variation (weapon 4600 with is_hold_variation)
+  -- 2. IronSight active + Preset active + laser disabled for weapon
+  local is_ironsight_active = (rawget(_G, "standalone_iron_sight_active") == true)
+  local preset_a_active = (rawget(_G, "custom_aim_preset_a_active") == true)
+  local preset_b_active = (rawget(_G, "custom_aim_preset_b_active") == true)
+  local preset_c_active = (rawget(_G, "custom_aim_preset_c_active") == true)
+  local preset_d_active = (rawget(_G, "custom_aim_preset_d_active") == true)
+  local any_preset_active = preset_a_active or preset_b_active or preset_c_active or preset_d_active
+  local weapon_id_str = tostring(current_weapon_id)
+  local laser_disabled_for_weapon = weapon_laser_enabled[weapon_id_str] == false
+  
+  local should_modify = (is_hold_variation and current_weapon_id == 4600) or 
+                        (is_ironsight_active and any_preset_active and laser_disabled_for_weapon)
+  
+  if not should_modify then
+    return -- Don't modify bullet spawn
+  end
+  
   local shell_generator = sdk.to_managed_object(args[2])
   local arrow_shell_generator = sdk.to_managed_object(args[2])
   local gun = shell_generator:get_field("_OwnerInterface")
@@ -355,17 +376,21 @@ local function manage_hooks(force_check)
   local laser_enabled_for_weapon = weapon_laser_enabled[weapon_id_str] ~= false  -- Default true if nil
   
   -- Check if IronSight + Preset mode is active (needs hook for muzzle spawns)
-  local is_ironsight_active = (_G.force_classic_re4_style == true)
+  -- Use standalone_iron_sight_active which is set when iron sight is actually active (aiming)
+  local is_ironsight_active = (rawget(_G, "standalone_iron_sight_active") == true)
   local fp_active = (rawget(_G, "standalone_first_person_active") == true)
   local preset_a_active = (rawget(_G, "custom_aim_preset_a_active") == true)
   local preset_b_active = (rawget(_G, "custom_aim_preset_b_active") == true)
   local preset_c_active = (rawget(_G, "custom_aim_preset_c_active") == true)
   local preset_d_active = (rawget(_G, "custom_aim_preset_d_active") == true)
-  local fp_preset_active = fp_active and (preset_a_active or preset_b_active or preset_c_active or preset_d_active)
-  local ironsight_preset_override = (is_ironsight_active or fp_preset_active) and laser_disabled_for_weapon
+  local any_preset_active = preset_a_active or preset_b_active or preset_c_active or preset_d_active
+  -- Hook only when IronSight is active AND a preset is active AND laser is disabled for weapon
+  local ironsight_preset_override = is_ironsight_active and any_preset_active and laser_disabled_for_weapon
+  
+  log.info("[ClassicRE4Laser] manage_hooks: ironsight=" .. tostring(is_ironsight_active) .. " preset=" .. tostring(any_preset_active) .. " laser_disabled=" .. tostring(laser_disabled_for_weapon) .. " override=" .. tostring(ironsight_preset_override) .. " static_dot=" .. tostring(static_center_dot))
   
   -- Don't apply hook logic if static center dot (RE4 Remake style) is enabled
-  -- OR if laser is disabled for current weapon WITHOUT IronSight/Preset override
+  -- OR if laser is disabled for current weapon WITHOUT IronSight+Preset override
   if static_center_dot or (laser_disabled_for_weapon and not ironsight_preset_override) then
     -- If hooks are currently active but static/disabled mode is enabled, unhook them
     if is_hooks_active then
@@ -375,14 +400,18 @@ local function manage_hooks(force_check)
     return
   end
   
-  -- Hook if: Bolt Thrower hold variation OR IronSight/Preset with laser-disabled weapon
+  -- Hook if: Bolt Thrower hold variation OR IronSight+Preset with laser-disabled weapon
   local should_hook = (is_hold_variation and current_weapon_id == 4600) or ironsight_preset_override
+  
+  log.info("[ClassicRE4Laser] manage_hooks: should_hook=" .. tostring(should_hook) .. " is_hooks_active=" .. tostring(is_hooks_active))
   
   -- Only do something if the conditions have changed OR if forced
   if should_hook ~= last_hook_conditions or force_check then
     if should_hook and not is_hooks_active then
+      log.info("[ClassicRE4Laser] HOOKING requestFire")
       hook_request_fire()
     elseif not should_hook and is_hooks_active then
+      log.info("[ClassicRE4Laser] UNHOOKING requestFire")
       unhook_request_fire()
     end
     last_hook_conditions = should_hook
@@ -1072,7 +1101,21 @@ local preset_a_active = (rawget(_G, "custom_aim_preset_a_active") == true)
 local preset_b_active = (rawget(_G, "custom_aim_preset_b_active") == true)
 local preset_c_active = (rawget(_G, "custom_aim_preset_c_active") == true)
 local preset_d_active = (rawget(_G, "custom_aim_preset_d_active") == true)
-local fp_preset_ab_force_classic = fp_active and (preset_a_active or preset_b_active or preset_c_active or preset_d_active)
+local any_preset_active_now = preset_a_active or preset_b_active or preset_c_active or preset_d_active
+local fp_preset_ab_force_classic = fp_active and any_preset_active_now
+
+-- Track iron sight active state (aiming) to update hooks when aiming starts/stops
+local iron_sight_active_now = (rawget(_G, "standalone_iron_sight_active") == true)
+if iron_sight_active_now ~= iron_sight_active_prev then
+  iron_sight_active_prev = iron_sight_active_now
+  manage_hooks(true)  -- Re-evaluate hooks when iron sight aiming state changes
+end
+
+-- Track preset state changes to update hooks when presets toggle while IronSight is already active
+if any_preset_active_now ~= any_preset_active_prev then
+  any_preset_active_prev = any_preset_active_now
+  manage_hooks(true)  -- Re-evaluate hooks when preset state changes
+end
 
 local force_disable_shoulder = force_classic or fp_active
 
@@ -1081,7 +1124,7 @@ if force_disable_shoulder then
   shoulder_restore_frames = 0
   if not disable_shoulder_corrector then
     disable_shoulder_corrector = true
-    hasRunInitially = false
+    -- No need to set hasRunInitially = false - shoulder corrector is independent
   end
 else
   -- When iron sight or first person mode is toggled off, always uncheck Disable Shoulder Corrector
@@ -1128,7 +1171,7 @@ if not force_disable_shoulder and pending_shoulder_restore ~= nil then
   else
     if disable_shoulder_corrector ~= pending_shoulder_restore then
       disable_shoulder_corrector = pending_shoulder_restore
-      hasRunInitially = false
+      -- No need to set hasRunInitially = false - shoulder corrector is independent
     end
     pending_shoulder_restore = nil
   end
@@ -1196,18 +1239,18 @@ re.on_pre_gui_draw_element(function(element, context)
   local weapon_id_str = tostring(current_weapon_id)
   local laser_enabled_for_weapon = weapon_laser_enabled[weapon_id_str] ~= false
   
-  -- Hide dot when laser disabled AND IronSight/FP+Preset is active (early return for performance)
+  -- Hide dot when laser disabled AND IronSight+Preset is active (early return for performance)
   if not laser_enabled_for_weapon and not is_non_muzzle_weapon then
     local is_ironsight_active = (_G.force_classic_re4_style == true)
-    local fp_active = (rawget(_G, "standalone_first_person_active") == true)
     local preset_a_active = (rawget(_G, "custom_aim_preset_a_active") == true)
     local preset_b_active = (rawget(_G, "custom_aim_preset_b_active") == true)
     local preset_c_active = (rawget(_G, "custom_aim_preset_c_active") == true)
     local preset_d_active = (rawget(_G, "custom_aim_preset_d_active") == true)
-    local fp_preset_active = fp_active and (preset_a_active or preset_b_active or preset_c_active or preset_d_active)
-    if is_ironsight_active or fp_preset_active then
+    local any_preset_active = preset_a_active or preset_b_active or preset_c_active or preset_d_active
+    -- Only hide dot when BOTH IronSight AND a preset are active
+    if is_ironsight_active and any_preset_active then
       if reticle_names[name] then
-        return false -- Hide dot when IronSight/FP+Preset overrides laser-disabled weapon
+        return false -- Hide dot when IronSight+Preset overrides laser-disabled weapon
       end
     end
   end
@@ -1217,6 +1260,13 @@ re.on_pre_gui_draw_element(function(element, context)
   if not show_laser_dot and enable_laser_trail and laser_enabled_for_weapon and not (simple_static_mode and not show_laser_dot) then
     if reticle_names[name] then
       return false -- Hide reticle when laser is off via hotkey, UNLESS simple static mode is enabled (then show white dot)
+    end
+  end
+  
+  -- Hide dot when Iron Sight is active AND laser is disabled for the weapon
+  if rawget(_G, "standalone_iron_sight_active") == true and not laser_enabled_for_weapon then
+    if reticle_names[name] then
+      return false -- Hide reticle when using iron sights with laser disabled
     end
   end
   
