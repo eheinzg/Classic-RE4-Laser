@@ -96,6 +96,332 @@ end
 local current_weapon_id = nil
 local current_muzzle_joint = nil
 
+-- Perfect accuracy feature
+if _G.classic_re4_laser_perfect_accuracy_enabled == nil then
+    _G.classic_re4_laser_perfect_accuracy_enabled = true
+end
+
+-- Point range feature (separate from perfect accuracy)
+if _G.classic_re4_laser_point_range_enabled == nil then
+    _G.classic_re4_laser_point_range_enabled = true
+end
+
+-- Spread fields for perfect accuracy
+local spread_fields = {
+    random = "_RandomRadius",
+    randomFit = "_RandomRadius_Fit",
+}
+
+-- Spread cache for perfect accuracy (stores _MoveInfo objects from shell data)
+local spread_cache = {}
+local applied_zero_spread = false
+local force_spread_update = false  -- Flag to force reapplication after character change
+
+-- Forward declarations for defaults system (defined later, used early)
+local saved_defaults = nil
+local defaults_loaded = false
+local current_game_mode = "Main"
+local capture_defaults_pending = false
+
+local function load_defaults_file()
+    if defaults_loaded then return end
+    local status, data = pcall(json.load_file, "ClassicLaser\\WeaponDefaults.json")
+    if status and data then
+        saved_defaults = data
+    else
+        saved_defaults = {
+            Main = {spread = {}, point_range = {}},
+            AO = {spread = {}, point_range = {}},
+            MC = {spread = {}, point_range = {}}
+        }
+    end
+    if saved_defaults.spread and not saved_defaults.Main then
+        local old_data = {spread = saved_defaults.spread, point_range = saved_defaults.point_range}
+        saved_defaults = {
+            Main = old_data,
+            AO = {spread = {}, point_range = {}},
+            MC = {spread = {}, point_range = {}}
+        }
+    end
+    defaults_loaded = true
+end
+
+local function save_defaults_file()
+    if saved_defaults then
+        pcall(json.dump_file, "ClassicLaser\\WeaponDefaults.json", saved_defaults)
+    end
+end
+
+-- Helper to check if managed object is valid
+local function is_valid_managed(obj)
+    if not obj then return false end
+    if tostring(obj) == "nil" then return false end
+    if sdk.is_managed_object then
+        local ok, result = pcall(sdk.is_managed_object, obj)
+        if ok and result == false then return false end
+    end
+    return true
+end
+
+-- Read spread field from _MoveInfo param
+local function read_spread_field(param, field)
+    local ok, value = pcall(function()
+        return param:get_field(field)
+    end)
+    if ok then
+        return value
+    end
+    return nil
+end
+
+-- Write spread field to _MoveInfo param (use direct assignment like DWP)
+local function write_spread_field(param, field, value)
+    pcall(function()
+        param[field] = value
+    end)
+end
+
+-- Apply zero spread to _MoveInfo param
+local function apply_zero_spread(param)
+    write_spread_field(param, "_RandomRadius", 0.0)
+    write_spread_field(param, "_RandomRadius_Fit", 0.0)
+end
+
+-- Restore spread values to _MoveInfo param (uses saved defaults from JSON file)
+local function restore_spread(param, values, cache_key)
+    if not values then return end
+    -- Try to get values from saved defaults file first (mode-specific)
+    load_defaults_file()
+    local mode_defaults = saved_defaults and saved_defaults[current_game_mode]
+    local saved_spread = mode_defaults and mode_defaults.spread and mode_defaults.spread[cache_key]
+    local random_val = saved_spread and saved_spread.random or values.random
+    local randomFit_val = saved_spread and saved_spread.randomFit or values.randomFit
+    if random_val ~= nil then
+        write_spread_field(param, "_RandomRadius", random_val)
+    end
+    if randomFit_val ~= nil then
+        write_spread_field(param, "_RandomRadius_Fit", randomFit_val)
+    end
+end
+
+-- Register a _MoveInfo target for spread modification
+local function register_spread_target(move_info, weapon_id)
+    if not move_info or not is_valid_managed(move_info) then
+        return
+    end
+    local key = tostring(move_info)
+    local entry = spread_cache[key]
+    if not entry then
+        local spread_values = {
+            random = read_spread_field(move_info, spread_fields.random),
+            randomFit = read_spread_field(move_info, spread_fields.randomFit),
+        }
+        
+        -- If capturing defaults, save current values to file (mode-specific)
+        if capture_defaults_pending and weapon_id then
+            load_defaults_file()
+            if not saved_defaults[current_game_mode] then
+                saved_defaults[current_game_mode] = {spread = {}, point_range = {}}
+            end
+            saved_defaults[current_game_mode].spread[tostring(weapon_id)] = {
+                random = spread_values.random,
+                randomFit = spread_values.randomFit,
+            }
+        end
+        
+        spread_cache[key] = {
+            object = move_info,
+            values = spread_values,
+            weapon_id = weapon_id,
+        }
+    else
+        entry.object = move_info
+        entry.weapon_id = weapon_id
+    end
+end
+
+-- Register spread targets from shell userdata (recursively finds _MoveInfo objects)
+-- Register spread targets from shell userdata (recursively finds _MoveInfo objects)
+local function register_spread_targets_from_shell(shell_userdata, weapon_id)
+    if not shell_userdata or not is_valid_managed(shell_userdata) then
+        return
+    end
+
+    local function handle_candidate(candidate)
+        if candidate == nil then
+            return
+        end
+
+        if type(candidate) == "table" then
+            for _, element in ipairs(candidate) do
+                handle_candidate(element)
+            end
+            return
+        end
+
+        if not is_valid_managed(candidate) then
+            return
+        end
+
+        local ok_move, move_info = pcall(function()
+            return candidate:get_field("_MoveInfo")
+        end)
+        if ok_move and move_info and is_valid_managed(move_info) then
+            register_spread_target(move_info, weapon_id)
+            return
+        end
+
+        local iterator_success = false
+
+        if type(candidate.get_elements) == "function" then
+            local ok_elements, elements = pcall(function()
+                return candidate:get_elements()
+            end)
+            if ok_elements and elements then
+                iterator_success = true
+                for _, element in ipairs(elements) do
+                    handle_candidate(element)
+                end
+            end
+        end
+
+        if not iterator_success and type(candidate.call) == "function" then
+            local ok_count, count = pcall(function()
+                return candidate:call("get_Count")
+            end)
+            if ok_count and type(count) == "number" and count > 0 then
+                iterator_success = true
+                for i = 0, count - 1 do
+                    local ok_item, item = pcall(function()
+                        return candidate:call("get_Item", i)
+                    end)
+                    if ok_item and item then
+                        handle_candidate(item)
+                    end
+                end
+            end
+        end
+
+        if not iterator_success then
+            local ok_fields, fields = pcall(function()
+                return candidate:get_type_definition():get_fields()
+            end)
+            if ok_fields and fields then
+                for _, field in ipairs(fields) do
+                    if field:get_name():match("ShellInfoUserData") then
+                        local ok_sub, sub_obj = pcall(function()
+                            return candidate:get_field(field:get_name())
+                        end)
+                        if ok_sub and sub_obj then
+                            handle_candidate(sub_obj)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local candidate_fields = {
+        "_ShellInfoUserData",
+        "_CenterShellInfoUserData",
+        "_AroundShellInfoUserData",
+        "_ShellInfoUserDataList",
+        "_ShellInfoUserDataArray",
+    }
+
+    for _, field_name in ipairs(candidate_fields) do
+        local ok_field, field_obj = pcall(function()
+            return shell_userdata:get_field(field_name)
+        end)
+        if ok_field and field_obj then
+            handle_candidate(field_obj)
+        end
+    end
+
+    handle_candidate(shell_userdata)
+end
+
+-- Track last weapon ID and accuracy state to avoid redundant processing
+local last_spread_weapon_id = nil
+local last_spread_accuracy_state = nil
+
+-- Apply or restore spread based on perfect accuracy setting
+local function update_spread_state(bt_gun, weapon_id)
+    if not bt_gun or not is_valid_managed(bt_gun) then
+        return
+    end
+    
+    -- Check for perfect accuracy
+    -- Only check IronSight's flag when IronSight is actually active
+    local ironsight_active = rawget(_G, "standalone_iron_sight_active") == true
+    local ironsight_pa = ironsight_active and rawget(_G, "standalone_perfect_accuracy_enabled") == true
+    local pa_flag = _G.classic_re4_laser_perfect_accuracy_enabled
+    local should_zero = ironsight_pa or (pa_flag ~= false)
+    
+    -- Check if weapon changed or cache is empty (need to rebuild)
+    local weapon_changed = (weapon_id ~= last_spread_weapon_id)
+    local cache_empty = (next(spread_cache) == nil)
+    
+    -- Skip if nothing changed and state is already correct
+    local state_changed = weapon_changed or (should_zero ~= last_spread_accuracy_state) or force_spread_update or cache_empty
+    if not state_changed and applied_zero_spread == should_zero then
+        return
+    end
+    force_spread_update = false  -- Clear the force flag after processing
+    
+    -- Get shell generator and userdata (when weapon changes or cache is empty)
+    if weapon_changed or cache_empty then
+        -- Clear old cache when weapon changes
+        spread_cache = {}
+        applied_zero_spread = false
+        
+        local ok_shell, shell = pcall(function()
+            return bt_gun:get_field("<ShellGenerator>k__BackingField")
+        end)
+        
+        if ok_shell and shell and is_valid_managed(shell) then
+            local ok_userdata, shell_userdata = pcall(function()
+                return shell:get_field("_UserData")
+            end)
+            
+            if ok_userdata and shell_userdata and is_valid_managed(shell_userdata) then
+                register_spread_targets_from_shell(shell_userdata, weapon_id)
+            end
+        end
+    end
+    
+    -- Update tracking after shell generator check
+    last_spread_weapon_id = weapon_id
+    last_spread_accuracy_state = should_zero
+    
+    -- Apply zero spread if enabled and we have cached objects
+    if should_zero and next(spread_cache) ~= nil then
+        for spread_key, spread_entry in pairs(spread_cache) do
+            local spread_param = spread_entry.object
+            if spread_param and is_valid_managed(spread_param) then
+                apply_zero_spread(spread_param)
+            else
+                spread_cache[spread_key] = nil
+            end
+        end
+        applied_zero_spread = true
+    elseif not should_zero and applied_zero_spread then
+        -- Restore spread values
+        for spread_key, spread_entry in pairs(spread_cache) do
+            local spread_param = spread_entry.object
+            if spread_param and is_valid_managed(spread_param) then
+                local cache_key = spread_entry.weapon_id and tostring(spread_entry.weapon_id) or spread_key
+                restore_spread(spread_param, spread_entry.values, cache_key)
+            end
+            spread_cache[spread_key] = nil
+        end
+        applied_zero_spread = false
+    end
+end
+
+-- Cache for original point range values per weapon ID
+local original_point_ranges = {}
+
 local reticleValue = 4        
 
 local hasRunInitially = false
@@ -109,6 +435,7 @@ knife_dot_scale = 0.85  -- Default knife dot scale
 local min_scale = 0.3
 local max_scale = 1.25
 local config_file = "ClassicLaser\\LaserSettings.json"
+local defaults_file = "ClassicLaser\\WeaponDefaults.json"
 
 local character_ids = {
 "ch3a8z0_head", "ch6i0z0_head", "ch6i1z0_head", "ch6i2z0_head",
@@ -160,8 +487,9 @@ local weapon_names = {
 }
 
 -- Weapon categories for organized display
+-- Note: 4005 (Minecart Handgun) is excluded - it uses forced static mode only
 local weapon_categories = {
-    {name = "Handguns", ids = {4000, 4001, 4002, 4003, 4004, 4005, 6000, 6001, 6112, 6300}},
+    {name = "Handguns", ids = {4000, 4001, 4002, 4003, 4004, 6000, 6001, 6112, 6300}},
     {name = "Shotguns", ids = {4100, 4101, 4102, 6100, 6101, 6102}},
     {name = "SMGs", ids = {4200, 4201, 4202, 6103, 6104}},
     {name = "Rifles", ids = {4400, 4401, 4402, 6105, 6114}},
@@ -170,9 +498,7 @@ local weapon_categories = {
 }
 
 -- Per-weapon laser trail enable (default all enabled)
-local weapon_laser_enabled = {
-  ["4005"] = false  -- Minecart Handgun - laser disabled by default
-}
+local weapon_laser_enabled = {}
 
 -- Persistent color arrays for imgui.color_edit4
 local laser_beam_color_array = {1.0, 0.0, 0.0, 1.0}  -- RGBA values for laser beam (0.0-1.0)
@@ -444,6 +770,8 @@ local function save_config()
       static_reticle_color_array = static_reticle_color_array,  -- Static reticle color when weapon laser disabled
       laser_color_array = laser_color_array, -- Keep for legacy compatibility
       weapon_laser_enabled = weapon_laser_enabled,  -- Per-weapon laser enable
+      perfect_accuracy_enabled = _G.classic_re4_laser_perfect_accuracy_enabled,  -- Perfect accuracy setting
+      point_range_enabled = _G.classic_re4_laser_point_range_enabled,  -- Point range setting
   }
   local success, err = pcall(json.dump_file, config_file, data)
   if not success then
@@ -568,6 +896,16 @@ local function load_config()
     weapon_laser_enabled = data.weapon_laser_enabled
   end
   
+  -- Load perfect accuracy setting
+  if data.perfect_accuracy_enabled ~= nil then
+    _G.classic_re4_laser_perfect_accuracy_enabled = data.perfect_accuracy_enabled
+  end
+  
+  -- Load point range setting
+  if data.point_range_enabled ~= nil then
+    _G.classic_re4_laser_point_range_enabled = data.point_range_enabled
+  end
+  
   -- Update global flag for other mods to know Classic vs Remake bullet spawn per weapon
   update_spawn_flag()
   
@@ -579,6 +917,22 @@ local function write_valuetype(parent_obj, offset, value)
   for i = 0, value.type:get_valuetype_size() - 1 do
     parent_obj:write_byte(offset + i, value:read_byte(i))
   end
+end
+
+-- Perfect accuracy helper function
+local function is_perfect_accuracy_enabled()
+    -- Only check IronSight's PA flag when IronSight is actually active
+    local ironsight_active = rawget(_G, "standalone_iron_sight_active") == true
+    if ironsight_active then
+        local ironsight_pa = rawget(_G, "standalone_perfect_accuracy_enabled")
+        if ironsight_pa == true then
+            return true
+        end
+    end
+    
+    local flag = _G.classic_re4_laser_perfect_accuracy_enabled
+    -- Default to true if never set, otherwise use the actual value
+    return flag ~= false
 end
 
 local cast_ray_async = CastRays.cast_ray_async
@@ -821,6 +1175,12 @@ end
 local prev_weapon_id = current_weapon_id
 current_weapon_id = equip_weapon
 
+-- Force re-run updateReticles when switching to weapon 4005 (Minecart Handgun)
+-- This ensures the dot reticle is enabled even when the game auto-equips 4005 in minecart scene
+if current_weapon_id == 4005 and prev_weapon_id ~= 4005 then
+  hasRunInitially = false
+end
+
 -- Only check hooks if switching away from weapon 4600 (when hooks might be active)
 if prev_weapon_id == 4600 and current_weapon_id ~= 4600 and is_hooks_active then
   manage_hooks()
@@ -889,6 +1249,11 @@ else
     re4.last_shoot_pos = re4.last_muzzle_pos + (re4.last_muzzle_forward )
     re4.last_muzzle_joint = nil -- No joint for non-muzzle weapons
   end)
+end
+
+-- Update perfect accuracy spread state (only when weapon or setting changes)
+if bt_gun then
+  update_spread_state(bt_gun, equip_weapon)
 end
 end
 
@@ -961,7 +1326,7 @@ local function update_static_dot_interpolation()
           -- Apply surface offset from contact point (using unified constant)
           local new_target_intersection = contact_position - (camera_forward * SURFACE_OFFSET)
           
-          -- Hard limit: ensure dot never goes closer than 1.6 meters from camera
+          -- Hard limit: ensure dot never goes closer than 1.5 meters from camera
           local min_distance_from_camera = 1.5
           local camera_to_dot = new_target_intersection - camera_pos
           local distance_from_camera = camera_to_dot:length()
@@ -1005,7 +1370,9 @@ local laser_enabled_for_weapon = weapon_laser_enabled[weapon_id_str] ~= false  -
 local has_stale_muzzle_data = static_center_dot and (os.clock() - last_crosshair_time) > 0.25
 local is_weapon_changing = _G._IsWeaponChanging == true
 
-local should_show = enable_laser_trail and re4.last_muzzle_pos and not is_non_muzzle_weapon and _G.is_aim and not (simple_static_mode and not show_laser_dot) and not has_stale_muzzle_data and laser_enabled_for_weapon and not is_weapon_changing
+-- Weapon 4005 always uses simple static mode internally
+local effective_simple_static = simple_static_mode or (current_weapon_id == 4005)
+local should_show = enable_laser_trail and re4.last_muzzle_pos and not is_non_muzzle_weapon and _G.is_aim and not (effective_simple_static and not show_laser_dot) and not has_stale_muzzle_data and laser_enabled_for_weapon and not is_weapon_changing
 
 -- Update last active time when trail should be shown
 if should_show then
@@ -1304,8 +1671,10 @@ end
 -- Update the re.on_pre_gui_draw_element function to respect show_laser_dot
 re.on_pre_gui_draw_element(function(element, context)
   -- Use 0.15s grace period matching the trail
+  -- Weapon 4005 (Minecart Handgun) always processes reticle regardless of aim state
   local within_grace_period = (os.clock() - last_laser_trail_active_time) < 0.15
-  if not _G.is_aim and not within_grace_period then
+  local force_process_4005 = (current_weapon_id == 4005)
+  if not force_process_4005 and not _G.is_aim and not within_grace_period then
     return true
   end
   
@@ -1334,7 +1703,10 @@ re.on_pre_gui_draw_element(function(element, context)
   
   -- Handle reticle visibility based on simple static mode functionality
   -- Note: When laser is disabled for a weapon in settings, we still show the dot (only hide trail)
-  if not show_laser_dot and enable_laser_trail and laser_enabled_for_weapon and not (simple_static_mode and not show_laser_dot) then
+  -- Weapon 4005 (Minecart Handgun) always shows dot reticle regardless of settings
+  local force_show_dot_4005 = (current_weapon_id == 4005)
+  local effective_simple_static = simple_static_mode or force_show_dot_4005
+  if not force_show_dot_4005 and not show_laser_dot and enable_laser_trail and laser_enabled_for_weapon and not (effective_simple_static and not show_laser_dot) then
     if reticle_names[name] then
       return false -- Hide reticle when laser is off via hotkey, UNLESS simple static mode is enabled (then show white dot)
     end
@@ -1389,7 +1761,16 @@ if reticle_names[name] then
         -- Handle dot visibility based on hotkey state and weapon laser settings
         -- Note: IronSight/FP+Preset hiding is already handled by early return above
         
-        if not laser_enabled_for_weapon then
+        -- Weapon 4005 (Minecart Handgun) always shows dot reticle
+        local force_show_dot_4005 = (current_weapon_id == 4005)
+        
+        if force_show_dot_4005 then
+          -- Always show visible dot for weapon 4005 using Static Reticle color
+          current_color.x = static_reticle_color_array[1] or 1.0
+          current_color.y = static_reticle_color_array[2] or 1.0
+          current_color.z = static_reticle_color_array[3] or 1.0
+          current_color.w = 1.0  -- Always fully visible
+        elseif not laser_enabled_for_weapon then
           -- Weapon has laser disabled in settings: show static colored dot with separate color
           current_color.x = static_reticle_color_array[1] or 1.0
           current_color.y = static_reticle_color_array[2] or 1.0
@@ -1397,7 +1778,9 @@ if reticle_names[name] then
           current_color.w = 1.0  -- Fully visible
         elseif not show_laser_dot then
           -- Laser is toggled OFF via hotkey
-          if simple_static_mode then
+          -- Weapon 4005 always uses simple static mode internally
+          local effective_simple_static = simple_static_mode or (current_weapon_id == 4005)
+          if effective_simple_static then
             -- Simple static mode enabled: show custom colored backup dot
             current_color.x = laser_color_array[1] or 1.0
             current_color.y = laser_color_array[2] or 0.0
@@ -1458,8 +1841,10 @@ if reticle_names[name] then
   end
   
   -- Handle positioning: prioritize simple static mode when laser is off, then static center vs dynamic
-  if (simple_static_mode and not show_laser_dot) or not laser_enabled_for_weapon then
-    -- Simple static mode with laser OFF or weapon laser disabled: use basic game positioning for static dot
+  -- Weapon 4005 always uses simple static mode regardless of checkbox state
+  local effective_simple_static = simple_static_mode or (current_weapon_id == 4005)
+  if (effective_simple_static and not show_laser_dot) or not laser_enabled_for_weapon or (current_weapon_id == 4005) then
+    -- Simple static mode with laser OFF or weapon laser disabled or weapon 4005: use basic game positioning for static dot
     view:call("set_ViewType", 0) -- Use game's default view type
     view:call("set_Overlay", true) -- Use game's default overlay
     view:call("set_Detonemap", true)
@@ -1563,12 +1948,15 @@ local function updateReticles()
     create_laser_trail()
   end
 
+  -- Detect game mode and set current_game_mode for defaults
   if scene:call("findGameObject(System.String)", "WeaponCatalog") then
       weaponCatalog = scene:call("findGameObject(System.String)", "WeaponCatalog")
+      current_game_mode = "Main"
   end
 
   if scene:call("findGameObject(System.String)", "WeaponCatalog_AO") then
       weaponCatalog = scene:call("findGameObject(System.String)", "WeaponCatalog_AO")
+      current_game_mode = "AO"
   end
 
   if not scene:call("findGameObject(System.String)", "WeaponCatalog") and not scene:call("findGameObject(System.String)", "WeaponCatalog_AO") then
@@ -1577,6 +1965,7 @@ local function updateReticles()
       weaponCatalogRegister2 = weaponCatalog2:call("getComponent(System.Type)", sdk.typeof("chainsaw.WeaponCatalogRegister"))
       WeaponEquipParamCatalogUserData2 = weaponCatalogRegister2:call("get_WeaponEquipParamCatalogUserData")
       weaponDataTables2 = WeaponEquipParamCatalogUserData2:get_field("_DataTable")
+      current_game_mode = "MC"
   end
 
   local weaponCatalogRegister = weaponCatalog:call("getComponent(System.Type)", sdk.typeof("chainsaw.WeaponCatalogRegister"))
@@ -1818,23 +2207,83 @@ local function updateReticles()
     end
 
     -- Handle reticle fit parameters for specific weapons
-    local reticleWeapons = {4400, 4401, 4402, 6105, 6114, 6304, 6102, 4501}
+    -- Weapon 4005 (Minecart Handgun) always uses dot reticle
+    local reticleWeapons = {4005, 4400, 4401, 4402, 6105, 6114, 6304, 6102, 4501}
     for _, id in ipairs(reticleWeapons) do
       if weaponID == id then
         local reticleFitParamTable = weaponData:get_field("_ReticleFitParamTable")
         if reticleFitParamTable then
           reticleFitParamTable:set_field("_ReticleShape", reticleValue)
-          local defaultParam = reticleFitParamTable:get_field("_DefaultParam")
-          if defaultParam then
-            local pointRange = defaultParam:get_field("_PointRange")
-            if pointRange then
-              pointRange.s = 100
-              pointRange.r = 100
-              write_valuetype(defaultParam, 0x10, pointRange)
+        end
+        break
+      end
+    end
+    
+    -- Point Range: Apply to ALL weapons with caching for restore
+    -- Rifles always get 100 point range regardless of setting
+    local isRifle = (weaponID == 4400 or weaponID == 4401 or weaponID == 4402 or weaponID == 6105 or weaponID == 6114)
+    local reticleFitParamTable = weaponData:get_field("_ReticleFitParamTable")
+    if reticleFitParamTable then
+      -- Helper function to apply point range to a param object
+      local function applyPointRange(param, cacheKey)
+        if not param then return end
+        local pointRange = param:get_field("_PointRange")
+        if pointRange then
+          -- If capturing defaults, save current values to file (mode-specific)
+          if capture_defaults_pending then
+            load_defaults_file()
+            if not saved_defaults[current_game_mode] then
+                saved_defaults[current_game_mode] = {spread = {}, point_range = {}}
+            end
+            saved_defaults[current_game_mode].point_range[tostring(cacheKey)] = {s = pointRange.s, r = pointRange.r}
+          end
+          
+          -- Cache original values if not already cached
+          if not original_point_ranges[cacheKey] then
+            original_point_ranges[cacheKey] = {s = pointRange.s, r = pointRange.r}
+          end
+          
+          if isRifle or _G.classic_re4_laser_point_range_enabled ~= false then
+            -- Rifles always get 100 point range, others only when setting enabled
+            pointRange.s = 100
+            pointRange.r = 100
+            write_valuetype(param, 0x10, pointRange)
+          else
+            -- Restore from saved defaults file first (mode-specific), then fallback to runtime cache
+            load_defaults_file()
+            local mode_defaults = saved_defaults and saved_defaults[current_game_mode]
+            local saved_pr = mode_defaults and mode_defaults.point_range and mode_defaults.point_range[tostring(cacheKey)]
+            local original = saved_pr or original_point_ranges[cacheKey]
+            if original then
+              pointRange.s = original.s
+              pointRange.r = original.r
+              write_valuetype(param, 0x10, pointRange)
             end
           end
         end
-        break
+      end
+      
+      -- Apply to _DefaultParam
+      local defaultParam = reticleFitParamTable:get_field("_DefaultParam")
+      applyPointRange(defaultParam, weaponID)
+      
+      -- Apply to _CustomParams (some weapons use these instead of or in addition to _DefaultParam)
+      local customParams = reticleFitParamTable:get_field("_CustomParams")
+      if customParams then
+        local customCount = customParams:call("get_Count")
+        if customCount then
+          for i = 0, customCount - 1 do
+            local customParam = customParams:call("get_Item", i)
+            if customParam then
+              local param = customParam:get_field("_Param")
+              if param then
+                -- Use a unique cache key for each custom param
+                local cacheKey = weaponID .. "_custom_" .. i
+                applyPointRange(param, cacheKey)
+              end
+            end
+          end
+        end
       end
     end
   end
@@ -1849,6 +2298,12 @@ local function updateReticles()
       end
     end
   end
+  
+  -- If capturing defaults, save to file and clear flag
+  if capture_defaults_pending then
+    save_defaults_file()
+    capture_defaults_pending = false
+  end
 end
 
 local function resetValues()        
@@ -1856,6 +2311,14 @@ local function resetValues()
   scene = nil
   hasRunInitially = false
   destroy_laser_trail()  -- Clean up laser trail when resetting
+  -- Reset spread cache for perfect accuracy
+  spread_cache = {}
+  applied_zero_spread = false
+  last_spread_weapon_id = nil
+  last_spread_accuracy_state = nil
+  force_spread_update = true  -- Force reapplication when new character loads
+  -- Reset point range cache (important for character changes)
+  original_point_ranges = {}
 end
 
 re.on_pre_application_entry("LockScene", function()
@@ -1994,6 +2457,34 @@ re.on_draw_ui(function()
         hasRunInitially = false
     end
     
+    imgui.same_line()
+    
+    -- Perfect Accuracy checkbox
+    local perfect_accuracy_enabled = _G.classic_re4_laser_perfect_accuracy_enabled ~= false
+    local pa_changed, pa_new = imgui.checkbox("Perfect Accuracy##classic_laser_perfect_accuracy", perfect_accuracy_enabled)
+    if pa_changed then
+        _G.classic_re4_laser_perfect_accuracy_enabled = pa_new
+        hasRunInitially = false  -- Force re-run updateReticles to apply/remove zero spread
+        save_config()  -- Save the setting immediately
+    end
+    if imgui.is_item_hovered() then
+        imgui.set_tooltip("Force zero weapon spread for perfect accuracy")
+    end
+    
+    imgui.same_line()
+    
+    -- Point Range checkbox
+    local point_range_enabled = _G.classic_re4_laser_point_range_enabled ~= false
+    local pr_changed, pr_new = imgui.checkbox("Point Range##classic_laser_point_range", point_range_enabled)
+    if pr_changed then
+        _G.classic_re4_laser_point_range_enabled = pr_new
+        hasRunInitially = false  -- Force re-run updateReticles to apply point range
+        save_config()  -- Save the setting immediately
+    end
+    if imgui.is_item_hovered() then
+        imgui.set_tooltip("Set point range to 100 for all weapons (affects reticle behavior)")
+    end
+    
     local hide_muzzle_changed = false
     hide_muzzle_changed, hide_dot_when_no_muzzle = imgui.checkbox("Hide dot when using knife", hide_dot_when_no_muzzle)
     if imgui.is_item_hovered() then
@@ -2001,6 +2492,79 @@ re.on_draw_ui(function()
     end
     if hide_muzzle_changed then
         save_config()
+    end
+    
+    -- Capture Defaults section
+    imgui.spacing()
+    imgui.text_colored("Capture Defaults (Mode: " .. current_game_mode .. "):", 0xFFAAAAFF)
+    imgui.same_line()
+    imgui.text_colored("[?]", 0xFFFFFF88)
+    if imgui.is_item_hovered() then
+        imgui.set_tooltip("Capture original weapon values for restoring when unchecking Perfect Accuracy / Point Range.\\nUncheck both settings first, then click the button for your current game mode.\\nMain = Leon/Ashley campaign\\nAO = Separate Ways (Ada)\\nMC = Mercenaries")
+    end
+    
+    -- Main capture button
+    if imgui.button("Main##capture_main") then
+        if current_game_mode == "Main" then
+            spread_cache = {}
+            applied_zero_spread = false
+            original_point_ranges = {}
+            load_defaults_file()
+            saved_defaults["Main"] = {spread = {}, point_range = {}}
+            capture_defaults_pending = true
+            hasRunInitially = false
+        end
+    end
+    if imgui.is_item_hovered() then
+        local tip = "Capture defaults for Main game (Leon/Ashley)"
+        if current_game_mode ~= "Main" then
+            tip = tip .. "\\n[Currently in " .. current_game_mode .. " mode - switch to Main first!]"
+        end
+        imgui.set_tooltip(tip)
+    end
+    
+    imgui.same_line()
+    
+    -- AO capture button
+    if imgui.button("Separate Ways##capture_ao") then
+        if current_game_mode == "AO" then
+            spread_cache = {}
+            applied_zero_spread = false
+            original_point_ranges = {}
+            load_defaults_file()
+            saved_defaults["AO"] = {spread = {}, point_range = {}}
+            capture_defaults_pending = true
+            hasRunInitially = false
+        end
+    end
+    if imgui.is_item_hovered() then
+        local tip = "Capture defaults for Separate Ways (Ada)"
+        if current_game_mode ~= "AO" then
+            tip = tip .. "\\n[Currently in " .. current_game_mode .. " mode - switch to AO first!]"
+        end
+        imgui.set_tooltip(tip)
+    end
+    
+    imgui.same_line()
+    
+    -- MC capture button
+    if imgui.button("Mercenaries##capture_mc") then
+        if current_game_mode == "MC" then
+            spread_cache = {}
+            applied_zero_spread = false
+            original_point_ranges = {}
+            load_defaults_file()
+            saved_defaults["MC"] = {spread = {}, point_range = {}}
+            capture_defaults_pending = true
+            hasRunInitially = false
+        end
+    end
+    if imgui.is_item_hovered() then
+        local tip = "Capture defaults for Mercenaries"
+        if current_game_mode ~= "MC" then
+            tip = tip .. "\\n[Currently in " .. current_game_mode .. " mode - switch to MC first!]"
+        end
+        imgui.set_tooltip(tip)
     end
     
     imgui.end_rect(1)
@@ -2622,6 +3186,10 @@ re.on_draw_ui(function()
     end
 
     for _, id in ipairs(ordered_ids) do
+      -- Skip weapon 4005 (Minecart Handgun) - it uses forced static mode only
+      if id == 4005 then
+        goto continue_weapon_loop
+      end
       local id_str = tostring(id)
       local name = weapon_names[id] or ("Unknown (" .. id_str .. ")")
       -- Default to true if not set
@@ -2638,6 +3206,7 @@ re.on_draw_ui(function()
           manage_hooks(true)
         end
       end
+      ::continue_weapon_loop::
     end
     
     imgui.end_rect(1)
