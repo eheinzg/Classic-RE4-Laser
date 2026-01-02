@@ -157,38 +157,35 @@ local function is_valid_managed(obj)
     if not obj then return false end
     if tostring(obj) == "nil" then return false end
     if sdk.is_managed_object then
-        local ok, result = pcall(sdk.is_managed_object, obj)
-        if ok and result == false then return false end
+        local result = sdk.is_managed_object(obj)
+        if result == false then return false end
     end
     return true
 end
 
 -- Read spread field from _MoveInfo param
 local function read_spread_field(param, field)
-    local ok, value = pcall(function()
-        return param:get_field(field)
-    end)
-    if ok then
-        return value
-    end
-    return nil
+    if not param or not is_valid_managed(param) then return nil end
+    local ok, val = pcall(function() return param:get_field(field) end)
+    return ok and val or nil
 end
 
 -- Write spread field to _MoveInfo param (use direct assignment like DWP)
 local function write_spread_field(param, field, value)
-    pcall(function()
-        param[field] = value
-    end)
+    if not param or not is_valid_managed(param) then return end
+    pcall(function() param[field] = value end)
 end
 
 -- Apply zero spread to _MoveInfo param
 local function apply_zero_spread(param)
+    if not param or not is_valid_managed(param) then return end
     write_spread_field(param, "_RandomRadius", 0.0)
     write_spread_field(param, "_RandomRadius_Fit", 0.0)
 end
 
 -- Restore spread values to _MoveInfo param (uses saved defaults from JSON file)
 local function restore_spread(param, values, cache_key)
+    if not param or not is_valid_managed(param) then return end
     if not values then return end
     -- Try to get values from saved defaults file first (mode-specific)
     load_defaults_file()
@@ -243,102 +240,88 @@ end
 -- Register spread targets from shell userdata (recursively finds _MoveInfo objects)
 -- Register spread targets from shell userdata (recursively finds _MoveInfo objects)
 local function register_spread_targets_from_shell(shell_userdata, weapon_id)
-    if not shell_userdata or not is_valid_managed(shell_userdata) then
-        return
+  if not shell_userdata or not is_valid_managed(shell_userdata) then
+    return
+  end
+
+  local function handle_candidate(candidate)
+    if candidate == nil then
+      return
     end
 
-    local function handle_candidate(candidate)
-        if candidate == nil then
-            return
-        end
-
-        if type(candidate) == "table" then
-            for _, element in ipairs(candidate) do
-                handle_candidate(element)
-            end
-            return
-        end
-
-        if not is_valid_managed(candidate) then
-            return
-        end
-
-        local ok_move, move_info = pcall(function()
-            return candidate:get_field("_MoveInfo")
-        end)
-        if ok_move and move_info and is_valid_managed(move_info) then
-            register_spread_target(move_info, weapon_id)
-            return
-        end
-
-        local iterator_success = false
-
-        if type(candidate.get_elements) == "function" then
-            local ok_elements, elements = pcall(function()
-                return candidate:get_elements()
-            end)
-            if ok_elements and elements then
-                iterator_success = true
-                for _, element in ipairs(elements) do
-                    handle_candidate(element)
-                end
-            end
-        end
-
-        if not iterator_success and type(candidate.call) == "function" then
-            local ok_count, count = pcall(function()
-                return candidate:call("get_Count")
-            end)
-            if ok_count and type(count) == "number" and count > 0 then
-                iterator_success = true
-                for i = 0, count - 1 do
-                    local ok_item, item = pcall(function()
-                        return candidate:call("get_Item", i)
-                    end)
-                    if ok_item and item then
-                        handle_candidate(item)
-                    end
-                end
-            end
-        end
-
-        if not iterator_success then
-            local ok_fields, fields = pcall(function()
-                return candidate:get_type_definition():get_fields()
-            end)
-            if ok_fields and fields then
-                for _, field in ipairs(fields) do
-                    if field:get_name():match("ShellInfoUserData") then
-                        local ok_sub, sub_obj = pcall(function()
-                            return candidate:get_field(field:get_name())
-                        end)
-                        if ok_sub and sub_obj then
-                            handle_candidate(sub_obj)
-                        end
-                    end
-                end
-            end
-        end
+    if type(candidate) == "table" then
+      for _, element in ipairs(candidate) do
+        handle_candidate(element)
+      end
+      return
     end
 
-    local candidate_fields = {
-        "_ShellInfoUserData",
-        "_CenterShellInfoUserData",
-        "_AroundShellInfoUserData",
-        "_ShellInfoUserDataList",
-        "_ShellInfoUserDataArray",
-    }
-
-    for _, field_name in ipairs(candidate_fields) do
-        local ok_field, field_obj = pcall(function()
-            return shell_userdata:get_field(field_name)
-        end)
-        if ok_field and field_obj then
-            handle_candidate(field_obj)
-        end
+    if not is_valid_managed(candidate) then
+      return
     end
 
-    handle_candidate(shell_userdata)
+    local move_info = candidate:get_field("_MoveInfo")
+    if move_info and is_valid_managed(move_info) then
+      register_spread_target(move_info, weapon_id)
+      return
+    end
+
+    local iterator_success = false
+
+    if type(candidate.get_elements) == "function" then
+      local elements = candidate:get_elements()
+      if elements then
+        iterator_success = true
+        for _, element in ipairs(elements) do
+          handle_candidate(element)
+        end
+      end
+    end
+
+    if not iterator_success and type(candidate.call) == "function" then
+      local count = candidate:call("get_Count")
+      if type(count) == "number" and count > 0 then
+        iterator_success = true
+        for i = 0, count - 1 do
+          local item = candidate:call("get_Item", i)
+          if item then
+            handle_candidate(item)
+          end
+        end
+      end
+    end
+
+    if not iterator_success then
+      local fields = candidate:get_type_definition():get_fields()
+      if fields then
+        for _, field in ipairs(fields) do
+          if field:get_name():match("ShellInfoUserData") then
+            local sub_obj = candidate:get_field(field:get_name())
+            if sub_obj then
+              handle_candidate(sub_obj)
+            end
+          end
+        end
+      end
+    end
+  end
+
+  local candidate_fields = {
+    "_ShellInfoUserData",
+    "_CenterShellInfoUserData",
+    "_AroundShellInfoUserData",
+    "_ShellInfoUserDataList",
+    "_ShellInfoUserDataArray",
+  }
+
+  for _, field_name in ipairs(candidate_fields) do
+    local field_obj = shell_userdata:get_field(field_name)
+    if field_obj then
+      handle_candidate(field_obj)
+    end
+  end
+
+  handle_candidate(shell_userdata)
 end
 
 -- Track last weapon ID and accuracy state to avoid redundant processing
@@ -375,18 +358,12 @@ local function update_spread_state(bt_gun, weapon_id)
         spread_cache = {}
         applied_zero_spread = false
         
-        local ok_shell, shell = pcall(function()
-            return bt_gun:get_field("<ShellGenerator>k__BackingField")
-        end)
-        
-        if ok_shell and shell and is_valid_managed(shell) then
-            local ok_userdata, shell_userdata = pcall(function()
-                return shell:get_field("_UserData")
-            end)
-            
-            if ok_userdata and shell_userdata and is_valid_managed(shell_userdata) then
-                register_spread_targets_from_shell(shell_userdata, weapon_id)
-            end
+        local shell = bt_gun:get_field("<ShellGenerator>k__BackingField")
+        if shell and is_valid_managed(shell) then
+          local shell_userdata = shell:get_field("_UserData")
+          if shell_userdata and is_valid_managed(shell_userdata) then
+            register_spread_targets_from_shell(shell_userdata, weapon_id)
+          end
         end
     end
     
@@ -506,6 +483,19 @@ local laser_dot_color_array = {1.0, 0.0, 0.0, 1.0}   -- RGBA values for laser do
 local knife_dot_color_array = {1.0, 1.0, 1.0, 1.0}   -- RGBA values for knife/no-muzzle dot (0.0-1.0)
 local static_reticle_color_array = {1.0, 1.0, 1.0, 1.0}  -- RGBA values for static reticle when weapon laser disabled (0.0-1.0)
 local laser_color_array = laser_dot_color_array       -- Legacy compatibility
+
+local function sanitize_color_array(arr, fallback)
+  local fb = fallback or {1.0, 1.0, 1.0, 1.0}
+  if type(arr) ~= "table" then
+    return {fb[1], fb[2], fb[3], fb[4] or 1.0}
+  end
+  return {
+    tonumber(arr[1]) or fb[1],
+    tonumber(arr[2]) or fb[2],
+    tonumber(arr[3]) or fb[3],
+    tonumber(arr[4]) or fb[4] or 1.0,
+  }
+end
 
 
 local static_center_dot = false  -- New option for static center dot
@@ -701,6 +691,136 @@ local function unhook_request_fire()
   is_hooks_active = false
 end
 
+-- ============================================================================
+-- Weapon 4005 (Minecart Handgun) First-Person Head Spawn Hook
+-- This hook is ALWAYS active and handles 4005 bullet spawn from head in FP mode
+-- ============================================================================
+local wp4005_hook = nil
+
+-- Helper function to get player head joint
+local function get_player_head_joint_for_4005()
+    local body = re4.body
+    if not body then return nil end
+    
+    local transform = body:call("get_Transform")
+    if not transform then return nil end
+    
+    local joints = transform:call("get_Joints")
+    if not joints then return nil end
+    
+    local count = joints:get_size()
+    
+    for i = 0, count - 1 do
+        local joint = joints:get_element(i)
+        if joint then
+            local jname = joint:call("get_Name")
+            if jname then
+                local name_str = tostring(jname):lower()
+                if name_str:find("head") then
+                    return joint
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- Helper function to get camera forward direction
+local function get_camera_forward_for_4005()
+    local camera = sdk.get_primary_camera()
+    if not camera then return nil end
+    
+    local camera_mat = camera:get_WorldMatrix()
+    if not camera_mat then return nil end
+    
+    local camera_rot = camera_mat:to_quat()
+    if not camera_rot then return nil end
+    
+    local forward = (camera_rot * Vector3f.new(0, 0, -1)):normalized()
+    return forward
+end
+
+-- Hook callback for 4005 head spawn
+local function on_pre_request_fire_4005(args)
+    -- Only handle weapon 4005 when FP mode is active
+    local fp_active = rawget(_G, "standalone_first_person_active") == true
+    if not fp_active then return end
+    
+    -- Get weapon ID from shell generator's owner name
+    local current_wid = nil
+    local shell_generator = sdk.to_managed_object(args[2])
+    if shell_generator then
+        local owner = shell_generator:get_field("_Owner")
+        if owner then
+            local owner_name = owner:call("get_Name")
+            if owner_name then
+                local wid_str = tostring(owner_name):match("wp(%d+)")
+                if wid_str then
+                    current_wid = tonumber(wid_str)
+                end
+            end
+        end
+    end
+    
+    -- Only handle 4005
+    if current_wid ~= 4005 then return end
+    
+    -- Get head joint and camera forward
+    local head_joint = get_player_head_joint_for_4005()
+    if not head_joint then return end
+    
+    local spawn_pos = joint_get_position(head_joint)
+    if not spawn_pos then return end
+    
+    local spawn_forward = get_camera_forward_for_4005()
+    if not spawn_forward then return end
+    
+    -- Set bullet spawn position to head
+    local pos_addr = sdk.to_ptr(sdk.to_int64(args[3]))
+    if pos_addr then
+        vec3_t:get_method("set_Item(System.Int32, System.Single)"):call(pos_addr, 0, spawn_pos.x)
+        vec3_t:get_method("set_Item(System.Int32, System.Single)"):call(pos_addr, 1, spawn_pos.y)
+        vec3_t:get_method("set_Item(System.Int32, System.Single)"):call(pos_addr, 2, spawn_pos.z)
+    end
+    
+    -- Set bullet direction to camera forward
+    local rot_addr = sdk.to_ptr(sdk.to_int64(args[4]))
+    if rot_addr then
+        local new_rotation = spawn_forward:to_quat()
+        quat_t:get_method("set_Item(System.Int32, System.Single)"):call(rot_addr, 0, new_rotation.x)
+        quat_t:get_method("set_Item(System.Int32, System.Single)"):call(rot_addr, 1, new_rotation.y)
+        quat_t:get_method("set_Item(System.Int32, System.Single)"):call(rot_addr, 2, new_rotation.z)
+        quat_t:get_method("set_Item(System.Int32, System.Single)"):call(rot_addr, 3, new_rotation.w)
+    end
+end
+
+local function on_post_request_fire_4005(retval)
+    return retval
+end
+
+-- Register 4005 hook (called only when weapon changes to 4005)
+local function init_4005_hook()
+    if wp4005_hook then return end  -- Already hooked
+    
+    local bullet_shell_generator_t = sdk.find_type_definition(sdk.game_namespace("BulletShellGenerator"))
+    if bullet_shell_generator_t then
+        local method = bullet_shell_generator_t:get_method("requestFire")
+        if method then
+            wp4005_hook = sdk.hook(method, on_pre_request_fire_4005, on_post_request_fire_4005)
+        end
+    end
+end
+
+-- Unhook 4005 hook (called only when weapon changes away from 4005)
+local function unhook_4005_hook()
+    if wp4005_hook then
+        wp4005_hook:unhook()
+        wp4005_hook = nil
+    end
+end
+
+-- ============================================================================
+
 -- Function to manage hooks based on conditions (only when conditions change)
 local function manage_hooks(force_check)
   -- Check if laser is enabled for current weapon
@@ -868,21 +988,29 @@ local function load_config()
   
   -- Load separate beam and dot colors
   if data.laser_beam_color_array then
-    laser_beam_color_array = data.laser_beam_color_array
+    laser_beam_color_array = sanitize_color_array(data.laser_beam_color_array, laser_beam_color_array)
+  else
+    laser_beam_color_array = sanitize_color_array(laser_beam_color_array, laser_beam_color_array)
   end
   if data.laser_dot_color_array then
-    laser_dot_color_array = data.laser_dot_color_array
+    laser_dot_color_array = sanitize_color_array(data.laser_dot_color_array, laser_dot_color_array)
+  else
+    laser_dot_color_array = sanitize_color_array(laser_dot_color_array, laser_dot_color_array)
   end
   if data.knife_dot_color_array then
-    knife_dot_color_array = data.knife_dot_color_array
+    knife_dot_color_array = sanitize_color_array(data.knife_dot_color_array, knife_dot_color_array)
+  else
+    knife_dot_color_array = sanitize_color_array(knife_dot_color_array, knife_dot_color_array)
   end
   if data.static_reticle_color_array then
-    static_reticle_color_array = data.static_reticle_color_array
+    static_reticle_color_array = sanitize_color_array(data.static_reticle_color_array, static_reticle_color_array)
+  else
+    static_reticle_color_array = sanitize_color_array(static_reticle_color_array, static_reticle_color_array)
   end
   -- Legacy compatibility - if old laser_color_array exists but new ones don't
   if data.laser_color_array and not data.laser_beam_color_array and not data.laser_dot_color_array then
-    laser_beam_color_array = {data.laser_color_array[1], data.laser_color_array[2], data.laser_color_array[3], data.laser_color_array[4]}
-    laser_dot_color_array = {data.laser_color_array[1], data.laser_color_array[2], data.laser_color_array[3], data.laser_color_array[4]}
+    laser_beam_color_array = sanitize_color_array({data.laser_color_array[1], data.laser_color_array[2], data.laser_color_array[3], data.laser_color_array[4]}, laser_beam_color_array)
+    laser_dot_color_array = sanitize_color_array({data.laser_color_array[1], data.laser_color_array[2], data.laser_color_array[3], data.laser_color_array[4]}, laser_dot_color_array)
   end
   laser_color_array = laser_dot_color_array -- Keep legacy compatibility
   
@@ -941,8 +1069,8 @@ local cast_ray_async = CastRays.cast_ray_async
 
 local function is_laser_trail_valid()
   if not laser_trail_gameobject then return false end
-  local success, valid = pcall(function() return laser_trail_gameobject:get_Valid() end)
-  if not success or not valid then
+  local valid = laser_trail_gameobject:get_Valid()
+  if not valid then
     laser_trail_gameobject = nil
     laser_mesh_resource = nil
     laser_material_resource = nil
@@ -971,48 +1099,46 @@ local function create_laser_trail()
   laser_trail_table["trail"] = laser_trail_gameobject
 
   -- Create mesh component and load resources
-  pcall(function()
-    local mesh_component = laser_trail_gameobject:call("createComponent(System.Type)", sdk.typeof("via.render.Mesh"))
-    if mesh_component then
-      mesh_component:set_DrawShadowCast(false)
-      -- Always recreate mesh resource to ensure it's valid for this scene
-      laser_mesh_resource = sdk.create_resource("via.render.MeshResource", "_chainsaw/character/wp/wp40/wp4000/21/wp4000_22.mesh")
-      if laser_mesh_resource then
-        laser_mesh_resource:add_ref()
-      end
-      
-      if laser_mesh_resource and laser_mesh_resource:get_address() ~= 0 then
-        local mesh_resource_holder = sdk.create_instance("via.render.MeshResourceHolder", true)
-        if mesh_resource_holder and mesh_resource_holder:get_address() ~= 0 then
-          mesh_resource_holder:add_ref()
-          mesh_resource_holder:write_qword(0x10, laser_mesh_resource:get_address())
-          -- Only call setMesh if mesh_component has valid address
-          if mesh_component:get_address() ~= 0 then
-            mesh_component:setMesh(mesh_resource_holder)
-          end
-        end
-      end
-      
-      -- Always recreate material resource to ensure it's valid for this scene
-      laser_material_resource = sdk.create_resource("via.render.MeshMaterialResource", "LaserColors/classicRE4LaserMaterial.mdf2")
-      if laser_material_resource then
-        laser_material_resource:add_ref()
-      end
-      
-      if laser_material_resource and laser_material_resource:get_address() ~= 0 then
-        -- Create material holder and apply material using set_Material()
-        local material_holder = sdk.create_instance("via.render.MeshMaterialResourceHolder", true)
-        if material_holder and material_holder:get_address() ~= 0 then
-          material_holder:add_ref()
-          material_holder:write_qword(0x10, laser_material_resource:get_address())
-          -- Only call set_Material if mesh_component has valid address
-          if mesh_component:get_address() ~= 0 then
-            mesh_component:set_Material(material_holder)
-          end
+  local mesh_component = laser_trail_gameobject:call("createComponent(System.Type)", sdk.typeof("via.render.Mesh"))
+  if mesh_component then
+    mesh_component:set_DrawShadowCast(false)
+    -- Always recreate mesh resource to ensure it's valid for this scene
+    laser_mesh_resource = sdk.create_resource("via.render.MeshResource", "_chainsaw/character/wp/wp40/wp4000/21/wp4000_22.mesh")
+    if laser_mesh_resource then
+      laser_mesh_resource:add_ref()
+    end
+    
+    if laser_mesh_resource and laser_mesh_resource:get_address() ~= 0 then
+      local mesh_resource_holder = sdk.create_instance("via.render.MeshResourceHolder", true)
+      if mesh_resource_holder and mesh_resource_holder:get_address() ~= 0 then
+        mesh_resource_holder:add_ref()
+        mesh_resource_holder:write_qword(0x10, laser_mesh_resource:get_address())
+        -- Only call setMesh if mesh_component has valid address
+        if mesh_component:get_address() ~= 0 then
+          mesh_component:setMesh(mesh_resource_holder)
         end
       end
     end
-  end)
+    
+    -- Always recreate material resource to ensure it's valid for this scene
+    laser_material_resource = sdk.create_resource("via.render.MeshMaterialResource", "LaserColors/classicRE4LaserMaterial.mdf2")
+    if laser_material_resource then
+      laser_material_resource:add_ref()
+    end
+    
+    if laser_material_resource and laser_material_resource:get_address() ~= 0 then
+      -- Create material holder and apply material using set_Material()
+      local material_holder = sdk.create_instance("via.render.MeshMaterialResourceHolder", true)
+      if material_holder and material_holder:get_address() ~= 0 then
+        material_holder:add_ref()
+        material_holder:write_qword(0x10, laser_material_resource:get_address())
+        -- Only call set_Material if mesh_component has valid address
+        if mesh_component:get_address() ~= 0 then
+          mesh_component:set_Material(material_holder)
+        end
+      end
+    end
+  end
   -- Apply loaded material params immediately after mesh is created
   apply_laser_trail_settings()
   
@@ -1022,9 +1148,7 @@ end
 
 local function destroy_laser_trail()
 if laser_trail_gameobject then
-  pcall(function()
-    laser_trail_gameobject:call("destroy", laser_trail_gameobject)
-  end)
+  laser_trail_gameobject:call("destroy", laser_trail_gameobject)
   laser_trail_gameobject = nil
 end
 end
@@ -1033,9 +1157,7 @@ end
 re.on_script_reset(function()
   -- Destroy laser trail table reference
   if laser_trail_table["trail"] then
-    pcall(function()
-      laser_trail_table["trail"]:call("destroy", laser_trail_table["trail"])
-    end)
+    laser_trail_table["trail"]:call("destroy", laser_trail_table["trail"])
     laser_trail_table["trail"] = nil
   end
   
@@ -1159,16 +1281,48 @@ if not cached_pl_head then
   return
 end
 
-local player_equip = nil
+-- Ensure cached head object remains valid
+if cached_pl_head.get_Valid and not cached_pl_head:get_Valid() then
+  cached_pl_head = nil
+  return
+end
+
+local player_equip = cached_pl_head:call("getComponent(System.Type)", sdk.typeof("chainsaw.PlayerEquipment"))
 local equip_weapon = nil
-pcall(function()
-  player_equip = cached_pl_head:call("getComponent(System.Type)", sdk.typeof("chainsaw.PlayerEquipment"))
-  if player_equip then
-    equip_weapon = player_equip:call("get_EquipWeaponID()")
-  end
-end)
+if player_equip then
+  equip_weapon = player_equip:call("get_EquipWeaponID()")
+end
 if not player_equip or not equip_weapon then
   return
+end
+
+-- Skip entire muzzle tracking for weapon 4005 (Minecart Handgun) when FP mode is active
+-- Let FirstPersonMode.lua handle bullet spawning completely
+-- Clear any muzzle data and temporarily disable laser presence flag so FP mode takes full control
+local fp_active = rawget(_G, "standalone_first_person_active") == true
+if equip_weapon == 4005 and fp_active then
+  -- Clear muzzle data
+  re4.last_muzzle_pos = nil
+  re4.last_muzzle_forward = nil
+  re4.last_shoot_pos = nil
+  re4.last_shoot_dir = nil
+  re4.last_muzzle_joint = nil
+  -- Temporarily make it look like this script isn't present for 4005
+  _G.__classic_re4_laser_present = false
+  -- Still need to track weapon ID and manage hook before returning
+  local prev_weapon_id = current_weapon_id
+  current_weapon_id = equip_weapon
+  -- Hook 4005 when switching TO 4005 (only on weapon change)
+  if current_weapon_id == 4005 and prev_weapon_id ~= 4005 then
+    init_4005_hook()
+    hasRunInitially = false  -- Force reticle update
+  end
+  return
+end
+
+-- Restore the presence flag for all other weapons
+if equip_weapon ~= 4005 then
+  _G.__classic_re4_laser_present = true
 end
 
 -- Store weapon ID globally for laser trail offset calculations
@@ -1179,6 +1333,12 @@ current_weapon_id = equip_weapon
 -- This ensures the dot reticle is enabled even when the game auto-equips 4005 in minecart scene
 if current_weapon_id == 4005 and prev_weapon_id ~= 4005 then
   hasRunInitially = false
+  init_4005_hook()
+end
+
+-- Unhook 4005 when switching AWAY from 4005 (only on weapon change)
+if prev_weapon_id == 4005 and current_weapon_id ~= 4005 then
+  unhook_4005_hook()
 end
 
 -- Only check hooks if switching away from weapon 4600 (when hooks might be active)
@@ -1188,15 +1348,13 @@ end
 
 -- Use cached weapon object or refresh if weapon changed
 if not cached_gun_obj or cached_weapon_id ~= equip_weapon or (current_time - cache_refresh_time) > cache_refresh_interval then
-  pcall(function()
-    cached_gun_obj = scene:call("findGameObject(System.String)", "wp" .. tostring(equip_weapon))
-    if not cached_gun_obj then
-      cached_gun_obj = scene:call("findGameObject(System.String)", "wp" .. tostring(equip_weapon) .. "_AO")
-    end
-    if not cached_gun_obj then
-      cached_gun_obj = scene:call("findGameObject(System.String)", "wp" .. tostring(equip_weapon) .. "_MC")
-    end
-  end)
+  cached_gun_obj = scene:call("findGameObject(System.String)", "wp" .. tostring(equip_weapon))
+  if not cached_gun_obj then
+    cached_gun_obj = scene:call("findGameObject(System.String)", "wp" .. tostring(equip_weapon) .. "_AO")
+  end
+  if not cached_gun_obj then
+    cached_gun_obj = scene:call("findGameObject(System.String)", "wp" .. tostring(equip_weapon) .. "_MC")
+  end
   cached_weapon_id = equip_weapon
   cache_refresh_time = current_time
 end
@@ -1204,28 +1362,25 @@ if not cached_gun_obj then
   return
 end
 
-local bt_gun = nil
-local bt_arms = nil
+local bt_gun = cached_gun_obj:call("getComponent(System.Type)", sdk.typeof("chainsaw.Gun"))
+local bt_arms = cached_gun_obj:call("getComponent(System.Type)", sdk.typeof("chainsaw.Arms"))
 local muzzle_joint = nil
-pcall(function()
-  bt_gun = cached_gun_obj:call("getComponent(System.Type)", sdk.typeof("chainsaw.Gun"))
-  bt_arms = cached_gun_obj:call("getComponent(System.Type)", sdk.typeof("chainsaw.Arms"))
-  if bt_arms then
-    muzzle_joint = bt_arms:call("getMuzzleJoint")
+if bt_arms then
+  muzzle_joint = bt_arms:call("getMuzzleJoint")
+end
+if not muzzle_joint then
+  local gun_transforms = cached_gun_obj:get_Transform()
+  if gun_transforms then
+    muzzle_joint = gun_transforms:call("getJointByName", "vfx_muzzle")
   end
-  if not muzzle_joint then
-    local gun_transforms = cached_gun_obj:get_Transform()
-    if gun_transforms then
-      muzzle_joint = gun_transforms:call("getJointByName", "vfx_muzzle")
-    end
-  end
-end)
+end
 
 if muzzle_joint then
   -- Has muzzle - normal weapon
   is_non_muzzle_weapon = false
   current_muzzle_joint = muzzle_joint  -- Store globally for laser trail offsets
-  pcall(function()
+  -- Skip muzzle data update for weapon 4005 (Minecart Handgun) - let game/FPMode handle it
+  if equip_weapon ~= 4005 then
     local muzzle_position = joint_get_position(muzzle_joint)
     re4.last_muzzle_pos = muzzle_position
     re4.last_muzzle_forward = muzzle_joint:call("get_AxisZ")
@@ -1233,22 +1388,20 @@ if muzzle_joint then
     local muzzle_offset = 0.1
     re4.last_shoot_pos = re4.last_muzzle_pos + (re4.last_muzzle_forward * muzzle_offset)
     re4.last_muzzle_joint = muzzle_joint -- Store the joint for local offset use
-  end)
-else
-  -- No muzzle - non-muzzle weapon (knife, etc.)
+  end
+elseif equip_weapon ~= 4005 then
+  -- No muzzle - non-muzzle weapon (knife, etc.) - skip for 4005
   is_non_muzzle_weapon = true
   current_muzzle_joint = nil  -- No joint for non-muzzle weapons
-  pcall(function()
-    local camera_mat = sdk.get_primary_camera():get_WorldMatrix()
-    re4.last_muzzle_pos = camera_mat[3]
-    re4.last_muzzle_pos.w = 1.0
-    local muzzle_rot = camera_mat:to_quat()
-    re4.last_muzzle_forward = (muzzle_rot * Vector3f.new(0, 0, -1)):normalized()
-    re4.last_shoot_dir = re4.last_muzzle_forward
-    local camera_offset = 2
-    re4.last_shoot_pos = re4.last_muzzle_pos + (re4.last_muzzle_forward )
-    re4.last_muzzle_joint = nil -- No joint for non-muzzle weapons
-  end)
+  local camera_mat = sdk.get_primary_camera():get_WorldMatrix()
+  re4.last_muzzle_pos = camera_mat[3]
+  re4.last_muzzle_pos.w = 1.0
+  local muzzle_rot = camera_mat:to_quat()
+  re4.last_muzzle_forward = (muzzle_rot * Vector3f.new(0, 0, -1)):normalized()
+  re4.last_shoot_dir = re4.last_muzzle_forward
+  local camera_offset = 2
+  re4.last_shoot_pos = re4.last_muzzle_pos + (re4.last_muzzle_forward )
+  re4.last_muzzle_joint = nil -- No joint for non-muzzle weapons
 end
 
 -- Update perfect accuracy spread state (only when weapon or setting changes)
@@ -1412,120 +1565,113 @@ if not laser_transform then
   return
 end
 
--- Use the same intersection and direction as the dot (shared muzzle data)
-pcall(function()
-  local equipped_weapon_id = tostring(current_weapon_id)
-  local offset_tbl = (equipped_weapon_id and laser_origin_offsets and laser_origin_offsets[equipped_weapon_id]) or {x=laser_origin_offset_x, y=laser_origin_offset_y, z=laser_origin_offset_z}
-  local offset_x = offset_tbl.x or 0.0
-  local offset_y = offset_tbl.y or 0.0
-  local offset_z = offset_tbl.z or 0.0
-  local adjusted_muzzle_pos = re4.last_muzzle_pos
+local equipped_weapon_id = tostring(current_weapon_id)
+local offset_tbl = (equipped_weapon_id and laser_origin_offsets and laser_origin_offsets[equipped_weapon_id]) or {x=laser_origin_offset_x, y=laser_origin_offset_y, z=laser_origin_offset_z}
+local offset_x = offset_tbl.x or 0.0
+local offset_y = offset_tbl.y or 0.0
+local offset_z = offset_tbl.z or 0.0
+local adjusted_muzzle_pos = re4.last_muzzle_pos
 
-  if current_muzzle_joint then
-    local axis_x = current_muzzle_joint:call("get_AxisX")
-    local axis_y = current_muzzle_joint:call("get_AxisY")
-    local axis_z = current_muzzle_joint:call("get_AxisZ")
-    adjusted_muzzle_pos = adjusted_muzzle_pos
-      + (axis_x * offset_x)
-      + (axis_y * offset_y)
-      + (axis_z * offset_z)
+if current_muzzle_joint then
+  local axis_x = current_muzzle_joint:call("get_AxisX")
+  local axis_y = current_muzzle_joint:call("get_AxisY")
+  local axis_z = current_muzzle_joint:call("get_AxisZ")
+  adjusted_muzzle_pos = adjusted_muzzle_pos
+    + (axis_x * offset_x)
+    + (axis_y * offset_y)
+    + (axis_z * offset_z)
+else
+  adjusted_muzzle_pos = Vector3f.new(
+    re4.last_muzzle_pos.x + offset_x,
+    re4.last_muzzle_pos.y + offset_y,
+    re4.last_muzzle_pos.z + offset_z
+  )
+end
+
+-- Calculate endpoint: use same async method as static dot for consistent behavior
+local start_point = adjusted_muzzle_pos
+local end_point
+
+if static_center_dot and _G.is_aim and _G.is_reticle_displayed and (_G.is_active ~= false) then
+  -- For static mode, use the same cached intersection from the static dot's async raycast
+  if cached_static_intersection_point then
+    -- Use the same intersection point that the static dot is using
+    end_point = cached_static_intersection_point
   else
-    adjusted_muzzle_pos = Vector3f.new(
-      re4.last_muzzle_pos.x + offset_x,
-      re4.last_muzzle_pos.y + offset_y,
-      re4.last_muzzle_pos.z + offset_z
-    )
+    -- Fallback to crosshair position if cached intersection not available yet
+    end_point = re4.crosshair_pos
   end
+else
+  -- Use crosshair position for dynamic mode with unified trail offset
+  end_point = re4.crosshair_pos - (re4.crosshair_dir * TRAIL_OFFSET)
+end
 
-  -- Calculate endpoint: use same async method as static dot for consistent behavior
-  local start_point = adjusted_muzzle_pos
-  local end_point
-
-  if static_center_dot and _G.is_aim and _G.is_reticle_displayed and (_G.is_active ~= false) then
-    -- For static mode, use the same cached intersection from the static dot's async raycast
-    if cached_static_intersection_point then
-      -- Use the same intersection point that the static dot is using
-      end_point = cached_static_intersection_point
-    else
-      -- Fallback to crosshair position if cached intersection not available yet
-      end_point = re4.crosshair_pos
-    end
+-- Apply weapon-specific endpoint offset for laser trail only (does not affect dot)
+if current_weapon_id == 6102 then
+  -- Distance-based offset for weapon 6102 trail endpoint
+  local distance_to_target = (end_point - start_point):length()
+  local offset_y_trail
+  if distance_to_target > 10.0 then
+    offset_y_trail = -0.05  -- Over 10m
+  elseif distance_to_target > 5.0 then
+    offset_y_trail = -0.0175  -- 5-10m
   else
-    -- Use crosshair position for dynamic mode with unified trail offset
-    end_point = re4.crosshair_pos - (re4.crosshair_dir * TRAIL_OFFSET)
+    offset_y_trail = -0.015  -- Under 5m
   end
+  local trail_offset = Vector3f.new(0, offset_y_trail, 0)
+  end_point = end_point + trail_offset
+end
 
-  -- Apply weapon-specific endpoint offset for laser trail only (does not affect dot)
-  if current_weapon_id == 6102 then
-    -- Distance-based offset for weapon 6102 trail endpoint
-    local distance_to_target = (end_point - start_point):length()
-    local offset_y
-    if distance_to_target > 10.0 then
-      offset_y = -0.05  -- Over 10m
-    elseif distance_to_target > 5.0 then
-      offset_y = -0.0175  -- 5-10m
-    else
-      offset_y = -0.015  -- Under 5m
-    end
-    local trail_offset = Vector3f.new(0, offset_y, 0)
-    end_point = end_point + trail_offset
-  end
+-- Ensure start point doesn't go behind the muzzle
+local muzzle_to_start = start_point - adjusted_muzzle_pos
+local forward_projection = muzzle_to_start:dot(re4.crosshair_dir)
+if forward_projection < 0 then
+  start_point = adjusted_muzzle_pos
+end
 
-  -- Ensure start point doesn't go behind the muzzle
-  local muzzle_to_start = start_point - adjusted_muzzle_pos
-  local forward_projection = muzzle_to_start:dot(re4.crosshair_dir)
-  if forward_projection < 0 then
-    start_point = adjusted_muzzle_pos
-  end
+local distance = (end_point - start_point):length()
 
-  local distance = (end_point - start_point):length()
-  
-  laser_transform:set_Position(start_point)
-  local beam_direction = (end_point - start_point):normalized()
-  local default_forward = Vector3f.new(0, 0, 1)
-  local rotation_quat = default_forward:to_quat():slerp(beam_direction:to_quat(), 1.0)
-  laser_transform:set_Rotation(rotation_quat)
-  local beam_scale = laser_trail_scale
-  laser_transform:set_LocalScale(Vector3f.new(beam_scale, beam_scale, distance/7.7)) --maybe change mesh size instead of dividing
-end)
+laser_transform:set_Position(start_point)
+local beam_direction = (end_point - start_point):normalized()
+local default_forward = Vector3f.new(0, 0, 1)
+local rotation_quat = default_forward:to_quat():slerp(beam_direction:to_quat(), 1.0)
+laser_transform:set_Rotation(rotation_quat)
+local beam_scale = laser_trail_scale
+laser_transform:set_LocalScale(Vector3f.new(beam_scale, beam_scale, distance/7.7)) --maybe change mesh size instead of dividing
 end
 
 re.on_pre_application_entry("LockScene", function()
 -- Determine aiming state (is_aim) using CharacterContext, similar to reference
-pcall(function()
-  local character_manager = sdk.get_managed_singleton(sdk.game_namespace("CharacterManager"))
-  local CharacterContext = nil
-  if character_manager then
-    CharacterContext = character_manager:call("getPlayerContextRef")
+local character_manager = sdk.get_managed_singleton(sdk.game_namespace("CharacterManager"))
+local CharacterContext = nil
+if character_manager then
+  CharacterContext = character_manager:call("getPlayerContextRef")
+end
+if CharacterContext then
+  _G.is_aim = CharacterContext:call("get_IsShootEnable")
+  _G.is_reticle_displayed = CharacterContext:call("get_IsReticleDisp")
+  _G._IsWeaponChanging = CharacterContext:call("get_IsWeaponChanging") or false
+  --_G.is_shoot_inhibited = CharacterContext:call("get_IsShootInhibit")
+  
+  -- Check for hold variation state
+  local prev_hold_variation = is_hold_variation
+  is_hold_variation = CharacterContext:call("get_IsHoldVariation") or false
+  -- Only check hooks if hold variation state changed AND we're using weapon 4600
+  if prev_hold_variation ~= is_hold_variation and current_weapon_id == 4600 then
+    manage_hooks()
   end
-  if CharacterContext then
-    _G.is_aim = CharacterContext:call("get_IsShootEnable")
-    _G.is_reticle_displayed = CharacterContext:call("get_IsReticleDisp")
-    _G._IsWeaponChanging = CharacterContext:call("get_IsWeaponChanging") or false
-    --_G.is_shoot_inhibited = CharacterContext:call("get_IsShootInhibit")
-    
-    -- Check for hold variation state
-    pcall(function()
-      local prev_hold_variation = is_hold_variation
-      is_hold_variation = CharacterContext:call("get_IsHoldVariation") or false
-      -- Only check hooks if hold variation state changed AND we're using weapon 4600
-      if prev_hold_variation ~= is_hold_variation and current_weapon_id == 4600 then
-        manage_hooks()
-      end
-    end)
-  else
-    _G.is_aim = false
-    _G.is_reticle_displayed = false
-    _G._IsWeaponChanging = false
-    --_G.is_shoot_inhibited = false
-    local prev_hold_variation = is_hold_variation
-    is_hold_variation = false
-    -- Only check hooks if hold variation state changed AND we had weapon 4600
-    if prev_hold_variation ~= is_hold_variation and current_weapon_id == 4600 then
-      manage_hooks()
-    end
+else
+  _G.is_aim = false
+  _G.is_reticle_displayed = false
+  _G._IsWeaponChanging = false
+  --_G.is_shoot_inhibited = false
+  local prev_hold_variation = is_hold_variation
+  is_hold_variation = false
+  -- Only check hooks if hold variation state changed AND we had weapon 4600
+  if prev_hold_variation ~= is_hold_variation and current_weapon_id == 4600 then
+    manage_hooks()
   end
-end)
+end
 
 local force_classic = (_G.force_classic_re4_style == true)
 local fp_active = (rawget(_G, "standalone_first_person_active") == true)
@@ -1626,11 +1772,9 @@ else
   update_muzzle_and_laser_data()
 
   -- Even when crosshair data is stale, still update muzzle position and laser trail
-  pcall(function()
-    if not scene then
-      return
-    end
-  end)
+  if not scene then
+    return
+  end
 end
 
 
@@ -1815,11 +1959,8 @@ if reticle_names[name] then
   end
 
   -- Detect _IsActive state for beam/trail behavior
-  local is_active = true  -- Default to active
-  pcall(function()
-    is_active = reticle_behavior:call('get_IsActive')
-    if is_active == nil then is_active = true end
-  end)
+  local is_active = reticle_behavior:call('get_IsActive')
+  if is_active == nil then is_active = true end
   _G.is_active = is_active
 
   last_crosshair_time = os.clock()
@@ -2319,6 +2460,8 @@ local function resetValues()
   force_spread_update = true  -- Force reapplication when new character loads
   -- Reset point range cache (important for character changes)
   original_point_ranges = {}
+  -- Reset weapon ID so 4005 detection works on new scene
+  current_weapon_id = nil
 end
 
 re.on_pre_application_entry("LockScene", function()
@@ -2467,22 +2610,16 @@ re.on_draw_ui(function()
         hasRunInitially = false  -- Force re-run updateReticles to apply/remove zero spread
         save_config()  -- Save the setting immediately
     end
-    if imgui.is_item_hovered() then
-        imgui.set_tooltip("Force zero weapon spread for perfect accuracy")
-    end
     
     imgui.same_line()
     
     -- Point Range checkbox
     local point_range_enabled = _G.classic_re4_laser_point_range_enabled ~= false
-    local pr_changed, pr_new = imgui.checkbox("Point Range##classic_laser_point_range", point_range_enabled)
+    local pr_changed, pr_new = imgui.checkbox("Perfect Focus##classic_laser_point_range", point_range_enabled)
     if pr_changed then
         _G.classic_re4_laser_point_range_enabled = pr_new
         hasRunInitially = false  -- Force re-run updateReticles to apply point range
         save_config()  -- Save the setting immediately
-    end
-    if imgui.is_item_hovered() then
-        imgui.set_tooltip("Set point range to 100 for all weapons (affects reticle behavior)")
     end
     
     local hide_muzzle_changed = false
@@ -2495,6 +2632,7 @@ re.on_draw_ui(function()
     end
     
     -- Capture Defaults section
+    --[[
     imgui.spacing()
     imgui.text_colored("Capture Defaults (Mode: " .. current_game_mode .. "):", 0xFFAAAAFF)
     imgui.same_line()
@@ -2568,6 +2706,9 @@ re.on_draw_ui(function()
     end
     
     imgui.end_rect(1)
+  --]]
+  
+  imgui.end_rect(1)
   
   imgui.spacing()
   
@@ -2662,25 +2803,32 @@ re.on_draw_ui(function()
   imgui.spacing()
   imgui.text_colored(" Custom Colors:", 0xFFFFFFAA)
   
-  -- Color Pickers side by side - Dot first, then Beam
-  local dot_color_changed, new_dot_color = nil, nil
-  local success_dot = pcall(function()
-      dot_color_changed, new_dot_color = imgui.color_edit3("Dot##dot_picker", laser_dot_color_array, 4194304 | 32)
-  end)
+  -- Ensure color arrays are valid before using imgui pickers
+  laser_dot_color_array = sanitize_color_array(laser_dot_color_array, {1.0, 0.0, 0.0, 1.0})
+  laser_beam_color_array = sanitize_color_array(laser_beam_color_array, {1.0, 0.0, 0.0, 1.0})
+  knife_dot_color_array = sanitize_color_array(knife_dot_color_array, {1.0, 1.0, 1.0, 1.0})
+  static_reticle_color_array = sanitize_color_array(static_reticle_color_array, {1.0, 1.0, 1.0, 1.0})
   
+  -- Color Pickers side by side - Dot first, then Beam
+  local dot_color = {
+    laser_dot_color_array and laser_dot_color_array[1] or 1.0,
+    laser_dot_color_array and laser_dot_color_array[2] or 0.0,
+    laser_dot_color_array and laser_dot_color_array[3] or 0.0
+  }
+  local dot_color_changed, new_dot_color
+  local success_dot = pcall(function()
+    dot_color_changed, new_dot_color = imgui.color_edit3("Dot##dot_picker", dot_color, 4194304 | 32)
+  end)
   if not success_dot then
-      local dot_color_array_4f = Vector4f.new(laser_dot_color_array[1], laser_dot_color_array[2], laser_dot_color_array[3], laser_dot_color_array[4] or 1.0)
-      dot_color_changed, new_dot_color = imgui.color_edit4("Dot##dot_picker", dot_color_array_4f, 4194304 | 32)
-      if new_dot_color then
-          laser_dot_color_array[1] = new_dot_color.x
-          laser_dot_color_array[2] = new_dot_color.y
-          laser_dot_color_array[3] = new_dot_color.z
-          laser_dot_color_array[4] = new_dot_color.w
-      end
+    local dot_color_array_4f = Vector4f.new(laser_dot_color_array[1], laser_dot_color_array[2], laser_dot_color_array[3], laser_dot_color_array[4] or 1.0)
+    dot_color_changed, new_dot_color = imgui.color_edit4("Dot##dot_picker", dot_color_array_4f, 4194304 | 32)
+    if new_dot_color then
+      laser_dot_color_array = {new_dot_color.x, new_dot_color.y, new_dot_color.z, new_dot_color.w}
+    end
   else
-      if new_dot_color then
-          laser_dot_color_array = new_dot_color
-      end
+    if new_dot_color then
+      laser_dot_color_array = new_dot_color
+    end
   end
   
   if imgui.is_item_hovered() then
@@ -2693,24 +2841,25 @@ re.on_draw_ui(function()
   end
   
   imgui.same_line()
-  local beam_color_changed, new_beam_color = nil, nil
+  local beam_color = {
+    laser_beam_color_array and laser_beam_color_array[1] or 1.0,
+    laser_beam_color_array and laser_beam_color_array[2] or 0.0,
+    laser_beam_color_array and laser_beam_color_array[3] or 0.0
+  }
+  local beam_color_changed, new_beam_color
   local success_beam = pcall(function()
-      beam_color_changed, new_beam_color = imgui.color_edit3("Beam##beam_picker", laser_beam_color_array, 4194304 | 32)
+    beam_color_changed, new_beam_color = imgui.color_edit3("Beam##beam_picker", beam_color, 4194304 | 32)
   end)
-  
   if not success_beam then
-      local beam_color_array_4f = Vector4f.new(laser_beam_color_array[1], laser_beam_color_array[2], laser_beam_color_array[3], laser_beam_color_array[4] or 1.0)
-      beam_color_changed, new_beam_color = imgui.color_edit4("Beam##beam_picker", beam_color_array_4f, 4194304 | 32)
-      if new_beam_color then
-          laser_beam_color_array[1] = new_beam_color.x
-          laser_beam_color_array[2] = new_beam_color.y
-          laser_beam_color_array[3] = new_beam_color.z
-          laser_beam_color_array[4] = new_beam_color.w
-      end
+    local beam_color_array_4f = Vector4f.new(laser_beam_color_array[1], laser_beam_color_array[2], laser_beam_color_array[3], laser_beam_color_array[4] or 1.0)
+    beam_color_changed, new_beam_color = imgui.color_edit4("Beam##beam_picker", beam_color_array_4f, 4194304 | 32)
+    if new_beam_color then
+      laser_beam_color_array = {new_beam_color.x, new_beam_color.y, new_beam_color.z, new_beam_color.w}
+    end
   else
-      if new_beam_color then
-          laser_beam_color_array = new_beam_color
-      end
+    if new_beam_color then
+      laser_beam_color_array = new_beam_color
+    end
   end
   
   if imgui.is_item_hovered() then
@@ -2723,24 +2872,25 @@ re.on_draw_ui(function()
   end
   
   imgui.same_line()
+  local knife_color = {
+    knife_dot_color_array and knife_dot_color_array[1] or 1.0,
+    knife_dot_color_array and knife_dot_color_array[2] or 1.0,
+    knife_dot_color_array and knife_dot_color_array[3] or 1.0
+  }
   local knife_color_changed, new_knife_color
   local success_knife = pcall(function()
-      knife_color_changed, new_knife_color = imgui.color_edit3("Knife##knife_picker", knife_dot_color_array, 4194304 | 32)
+    knife_color_changed, new_knife_color = imgui.color_edit3("Knife##knife_picker", knife_color, 4194304 | 32)
   end)
-  
   if not success_knife then
-      local knife_color_array_4f = Vector4f.new(knife_dot_color_array[1], knife_dot_color_array[2], knife_dot_color_array[3], knife_dot_color_array[4] or 1.0)
-      knife_color_changed, new_knife_color = imgui.color_edit4("Knife##knife_picker", knife_color_array_4f, 4194304 | 32)
-      if new_knife_color then
-          knife_dot_color_array[1] = new_knife_color.x
-          knife_dot_color_array[2] = new_knife_color.y
-          knife_dot_color_array[3] = new_knife_color.z
-          knife_dot_color_array[4] = new_knife_color.w
-      end
+    local knife_color_array_4f = Vector4f.new(knife_dot_color_array[1], knife_dot_color_array[2], knife_dot_color_array[3], knife_dot_color_array[4] or 1.0)
+    knife_color_changed, new_knife_color = imgui.color_edit4("Knife##knife_picker", knife_color_array_4f, 4194304 | 32)
+    if new_knife_color then
+      knife_dot_color_array = {new_knife_color.x, new_knife_color.y, new_knife_color.z, new_knife_color.w}
+    end
   else
-      if new_knife_color then
-          knife_dot_color_array = new_knife_color
-      end
+    if new_knife_color then
+      knife_dot_color_array = new_knife_color
+    end
   end
   
   if imgui.is_item_hovered() then
@@ -2752,24 +2902,25 @@ re.on_draw_ui(function()
   end
   
   -- Static reticle color (when weapon laser is disabled)
+  local static_reticle_color = {
+    static_reticle_color_array and static_reticle_color_array[1] or 1.0,
+    static_reticle_color_array and static_reticle_color_array[2] or 1.0,
+    static_reticle_color_array and static_reticle_color_array[3] or 1.0
+  }
   local static_reticle_color_changed, new_static_reticle_color
   local success_static = pcall(function()
-      static_reticle_color_changed, new_static_reticle_color = imgui.color_edit3("Static Reticle##static_reticle_picker", static_reticle_color_array, 4194304 | 32)
+    static_reticle_color_changed, new_static_reticle_color = imgui.color_edit3("Static Reticle##static_reticle_picker", static_reticle_color, 4194304 | 32)
   end)
-  
   if not success_static then
-      local static_reticle_color_array_4f = Vector4f.new(static_reticle_color_array[1], static_reticle_color_array[2], static_reticle_color_array[3], static_reticle_color_array[4] or 1.0)
-      static_reticle_color_changed, new_static_reticle_color = imgui.color_edit4("Static Reticle##static_reticle_picker", static_reticle_color_array_4f, 4194304 | 32)
-      if new_static_reticle_color then
-          static_reticle_color_array[1] = new_static_reticle_color.x
-          static_reticle_color_array[2] = new_static_reticle_color.y
-          static_reticle_color_array[3] = new_static_reticle_color.z
-          static_reticle_color_array[4] = new_static_reticle_color.w
-      end
+    local static_reticle_color_array_4f = Vector4f.new(static_reticle_color_array[1], static_reticle_color_array[2], static_reticle_color_array[3], static_reticle_color_array[4] or 1.0)
+    static_reticle_color_changed, new_static_reticle_color = imgui.color_edit4("Static Reticle##static_reticle_picker", static_reticle_color_array_4f, 4194304 | 32)
+    if new_static_reticle_color then
+      static_reticle_color_array = {new_static_reticle_color.x, new_static_reticle_color.y, new_static_reticle_color.z, new_static_reticle_color.w}
+    end
   else
-      if new_static_reticle_color then
-          static_reticle_color_array = new_static_reticle_color
-      end
+    if new_static_reticle_color then
+      static_reticle_color_array = new_static_reticle_color
+    end
   end
   
   if imgui.is_item_hovered() then
