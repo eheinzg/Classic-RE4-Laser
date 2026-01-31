@@ -42,7 +42,6 @@ local gameobject_get_transform = sdk.find_type_definition("via.GameObject"):get_
 local joint_get_position = sdk.find_type_definition("via.Joint"):get_method("get_Position")
 local joint_get_rotation = sdk.find_type_definition("via.Joint"):get_method("get_Rotation")
 
-local CollisionLayer = CastRays.CollisionLayer
 local CollisionFilter = CastRays.CollisionFilter
 
 local crosshair_bullet_ray_result = nil
@@ -55,6 +54,10 @@ local crosshair_frozen_time = 0
 local vec3_t = sdk.find_type_definition("via.vec3")
 local quat_t = sdk.find_type_definition("via.Quaternion")
 local raycastHit_t = sdk.find_type_definition(sdk.game_namespace("RaycastHit"))
+
+-- Cached methods for performance (avoid get_method calls in hot paths)
+local vec3_set_item = vec3_t and vec3_t:get_method("set_Item(System.Int32, System.Single)")
+local quat_set_item = quat_t and quat_t:get_method("set_Item(System.Int32, System.Single)")
 
 global_intersection_point = nil
 
@@ -508,6 +511,7 @@ local static_bullet_ray_result = nil  -- Persistent ray result for bullet layer
 local stored_static_center_dot = nil  -- Cache user preference when forced overrides run
 local force_classic_re4_prev = false  -- Track previous force state to restore preference
 local any_preset_active_prev = false  -- Track previous preset state to update hooks when presets change
+local skip_trail_frames = 0  -- Frame counter to skip drawing trail after mode switch
 local iron_sight_active_prev = false  -- Track iron sight active state (aiming) to update hooks
 local force_disable_shoulder_prev = false  -- Track previous force disable state (IronSight or FP mode)
 local last_crosshair_active_time = 0  -- Track when crosshair was last active for grace period
@@ -692,16 +696,44 @@ local function unhook_request_fire()
 end
 
 -- ============================================================================
--- Weapon 4005 (Minecart Handgun) First-Person Head Spawn Hook
--- This hook is ALWAYS active and handles 4005 bullet spawn from head in FP mode
+-- FP Mode Head Spawn Hook
+-- Handles head bullet spawn for:
+-- 1. Iron sight active (muzzle spawn)
+-- 2. Weapon 4005 (Minecart Handgun) when FP mode active (head spawn)
+-- 3. Any weapon when FP mode + RE4 Remake style laser active (head spawn)
+-- 4. Weapon with laser disabled + preset active (head spawn)
+-- 5. Weapon with laser disabled + Classic style (head spawn)
 -- ============================================================================
 local wp4005_hook = nil
+local shotgun_hook = nil  -- Separate hook for shotguns (ShotgunShellGenerator)
+local prev_fp_active_for_hook = false  -- Track FP mode state for hook management
+local prev_remake_style_for_hook = false  -- Track Remake style state for hook management
+local prev_preset_laser_disabled_for_hook = false  -- Track preset + laser disabled state
+local prev_classic_laser_disabled_for_hook = false  -- Track Classic style + laser disabled state
+local prev_ironsight_laser_disabled_for_hook = false  -- Track iron sight + laser disabled state
+local prev_any_preset_for_hook = false  -- Track any preset active state
 
--- Helper function to get player head joint
-local function get_player_head_joint_for_4005()
+-- Cached head joint for performance (refreshed when body changes)
+local cached_head_joint = nil
+local cached_head_joint_body = nil
+
+-- Helper function to get player head joint (cached)
+local function get_player_head_joint()
     local body = re4.body
-    if not body then return nil end
+    if not body then 
+        cached_head_joint = nil
+        cached_head_joint_body = nil
+        return nil 
+    end
     
+    -- Return cached joint if body hasn't changed and joint is still valid
+    if cached_head_joint and cached_head_joint_body == body then
+        if is_valid_managed(cached_head_joint) then
+            return cached_head_joint
+        end
+    end
+    
+    -- Need to find the head joint
     local transform = body:call("get_Transform")
     if not transform then return nil end
     
@@ -717,12 +749,19 @@ local function get_player_head_joint_for_4005()
             if jname then
                 local name_str = tostring(jname):lower()
                 if name_str:find("head") then
+                    cached_head_joint = joint
+                    cached_head_joint_body = body
                     return joint
                 end
             end
         end
     end
     return nil
+end
+
+-- Alias for backwards compatibility
+local function get_player_head_joint_for_4005()
+    return get_player_head_joint()
 end
 
 -- Helper function to get camera forward direction
@@ -740,11 +779,17 @@ local function get_camera_forward_for_4005()
     return forward
 end
 
--- Hook callback for 4005 head spawn
+-- Hook callback for FP mode bullet spawn
+-- Handles:
+-- 1. Iron sight active → muzzle spawn
+-- 2. Weapon 4005 in FP mode → head spawn
+-- 3. Any weapon with FP mode + RE4 Remake style laser → head spawn
+-- 4. Weapon with laser disabled + preset active → head spawn
+-- 5. Weapon with laser disabled (Classic style) → head spawn
+-- 6. Iron sight + laser disabled → muzzle spawn
 local function on_pre_request_fire_4005(args)
-    -- Only handle weapon 4005 when FP mode is active
+    local ironsight_active = rawget(_G, "standalone_iron_sight_active") == true
     local fp_active = rawget(_G, "standalone_first_person_active") == true
-    if not fp_active then return end
     
     -- Get weapon ID from shell generator's owner name
     local current_wid = nil
@@ -762,35 +807,112 @@ local function on_pre_request_fire_4005(args)
         end
     end
     
-    -- Only handle 4005
-    if current_wid ~= 4005 then return end
+    -- Check if weapon has laser disabled
+    local wid_str = current_wid and tostring(current_wid) or "unknown"
+    local laser_disabled = weapon_laser_enabled[wid_str] == false
     
-    -- Get head joint and camera forward
-    local head_joint = get_player_head_joint_for_4005()
+    -- Iron sight + laser disabled = muzzle spawn (works without FP mode)
+    if ironsight_active and laser_disabled then
+        if current_muzzle_joint then
+            local spawn_pos = joint_get_position(current_muzzle_joint)
+            if spawn_pos then
+                local muzzle_forward = current_muzzle_joint:call("get_AxisZ")
+                if muzzle_forward then
+                    -- Set bullet spawn position to muzzle
+                    local pos_addr = sdk.to_ptr(sdk.to_int64(args[3]))
+                    if pos_addr and vec3_set_item then
+                        vec3_set_item:call(pos_addr, 0, spawn_pos.x)
+                        vec3_set_item:call(pos_addr, 1, spawn_pos.y)
+                        vec3_set_item:call(pos_addr, 2, spawn_pos.z)
+                    end
+                    
+                    -- Set bullet direction to muzzle forward
+                    local rot_addr = sdk.to_ptr(sdk.to_int64(args[4]))
+                    if rot_addr and quat_set_item then
+                        local new_rotation = muzzle_forward:to_quat()
+                        quat_set_item:call(rot_addr, 0, new_rotation.x)
+                        quat_set_item:call(rot_addr, 1, new_rotation.y)
+                        quat_set_item:call(rot_addr, 2, new_rotation.z)
+                        quat_set_item:call(rot_addr, 3, new_rotation.w)
+                    end
+                end
+            end
+        end
+        return  -- Done with iron sight + laser disabled case
+    end
+    
+    -- If iron sight is active but laser is NOT disabled, don't modify spawn
+    if ironsight_active then
+        return
+    end
+    
+    -- Remaining logic requires FP mode
+    if not fp_active then return end
+    
+    -- Check other conditions (head spawn)
+    local is_4005 = (current_wid == 4005)
+    local is_remake_style = static_center_dot == true
+    local is_classic_style = not is_remake_style
+    
+    -- Check if preset is active (for preset + laser disabled condition)
+    local preset_a_active = rawget(_G, "custom_aim_preset_a_active") == true
+    local preset_b_active = rawget(_G, "custom_aim_preset_b_active") == true
+    local preset_c_active = rawget(_G, "custom_aim_preset_c_active") == true
+    local preset_d_active = rawget(_G, "custom_aim_preset_d_active") == true
+    local any_preset_active = preset_a_active or preset_b_active or preset_c_active or preset_d_active
+    local use_head_for_preset_laser_disabled = laser_disabled and any_preset_active
+    
+    -- Classic style + laser disabled = head spawn (no preset required)
+    local use_head_for_classic_laser_disabled = is_classic_style and laser_disabled
+    
+    -- Determine if we should modify bullet spawn at all
+    -- Remake style only uses head spawn when a preset is active
+    local use_head_for_remake_preset = is_remake_style and any_preset_active
+    local should_use_head = use_head_for_preset_laser_disabled or use_head_for_classic_laser_disabled or is_4005 or use_head_for_remake_preset
+    if not should_use_head then return end
+    
+    -- Get head joint for spawn position
+    local head_joint = get_player_head_joint()
     if not head_joint then return end
-    
     local spawn_pos = joint_get_position(head_joint)
     if not spawn_pos then return end
+    
+    -- Apply head camera offset from FirstPersonMode (in head local space)
+    local fp_head_offset = rawget(_G, "standalone_fp_head_offset")
+    if fp_head_offset and (fp_head_offset.x ~= 0 or fp_head_offset.y ~= 0 or fp_head_offset.z ~= 0) then
+        -- Get axes directly (no pcall closures for performance)
+        local axis_x = head_joint:call("get_AxisX")
+        local axis_y = head_joint:call("get_AxisY")
+        local axis_z = head_joint:call("get_AxisZ")
+        
+        if axis_x and axis_y and axis_z then
+            local offset_world = (axis_x * fp_head_offset.x) + (axis_y * fp_head_offset.y) + (axis_z * fp_head_offset.z)
+            spawn_pos = spawn_pos + offset_world
+        else
+            -- Fallback to world space offset if axes unavailable
+            spawn_pos = spawn_pos + Vector3f.new(fp_head_offset.x, fp_head_offset.y, fp_head_offset.z)
+        end
+    end
     
     local spawn_forward = get_camera_forward_for_4005()
     if not spawn_forward then return end
     
-    -- Set bullet spawn position to head
+    -- Set bullet spawn position to head (using cached methods for performance)
     local pos_addr = sdk.to_ptr(sdk.to_int64(args[3]))
-    if pos_addr then
-        vec3_t:get_method("set_Item(System.Int32, System.Single)"):call(pos_addr, 0, spawn_pos.x)
-        vec3_t:get_method("set_Item(System.Int32, System.Single)"):call(pos_addr, 1, spawn_pos.y)
-        vec3_t:get_method("set_Item(System.Int32, System.Single)"):call(pos_addr, 2, spawn_pos.z)
+    if pos_addr and vec3_set_item then
+        vec3_set_item:call(pos_addr, 0, spawn_pos.x)
+        vec3_set_item:call(pos_addr, 1, spawn_pos.y)
+        vec3_set_item:call(pos_addr, 2, spawn_pos.z)
     end
     
-    -- Set bullet direction to camera forward
+    -- Set bullet direction to camera forward (using cached methods for performance)
     local rot_addr = sdk.to_ptr(sdk.to_int64(args[4]))
-    if rot_addr then
+    if rot_addr and quat_set_item then
         local new_rotation = spawn_forward:to_quat()
-        quat_t:get_method("set_Item(System.Int32, System.Single)"):call(rot_addr, 0, new_rotation.x)
-        quat_t:get_method("set_Item(System.Int32, System.Single)"):call(rot_addr, 1, new_rotation.y)
-        quat_t:get_method("set_Item(System.Int32, System.Single)"):call(rot_addr, 2, new_rotation.z)
-        quat_t:get_method("set_Item(System.Int32, System.Single)"):call(rot_addr, 3, new_rotation.w)
+        quat_set_item:call(rot_addr, 0, new_rotation.x)
+        quat_set_item:call(rot_addr, 1, new_rotation.y)
+        quat_set_item:call(rot_addr, 2, new_rotation.z)
+        quat_set_item:call(rot_addr, 3, new_rotation.w)
     end
 end
 
@@ -798,24 +920,45 @@ local function on_post_request_fire_4005(retval)
     return retval
 end
 
--- Register 4005 hook (called only when weapon changes to 4005)
-local function init_4005_hook()
-    if wp4005_hook then return end  -- Already hooked
+-- Register FP mode head spawn hook (handles 4005 and all weapons with FP + Remake style)
+local function init_fp_head_spawn_hook()
+    -- Hook BulletShellGenerator (pistols, rifles, etc.)
+    if not wp4005_hook then
+        local bullet_shell_generator_t = sdk.find_type_definition(sdk.game_namespace("BulletShellGenerator"))
+        if bullet_shell_generator_t then
+            local method = bullet_shell_generator_t:get_method("requestFire")
+            if method then
+                wp4005_hook = sdk.hook(method, on_pre_request_fire_4005, on_post_request_fire_4005)
+            end
+        end
+    end
     
-    local bullet_shell_generator_t = sdk.find_type_definition(sdk.game_namespace("BulletShellGenerator"))
-    if bullet_shell_generator_t then
-        local method = bullet_shell_generator_t:get_method("requestFire")
-        if method then
-            wp4005_hook = sdk.hook(method, on_pre_request_fire_4005, on_post_request_fire_4005)
+    -- Hook ShotgunShellGenerator (shotguns like 4100, 4101, etc.)
+    if not shotgun_hook then
+        local shotgun_shell_generator_t = sdk.find_type_definition(sdk.game_namespace("ShotgunShellGenerator"))
+        if shotgun_shell_generator_t then
+            local method = shotgun_shell_generator_t:get_method("requestFire")
+            if method then
+                shotgun_hook = sdk.hook(method, on_pre_request_fire_4005, on_post_request_fire_4005)
+            end
         end
     end
 end
 
--- Unhook 4005 hook (called only when weapon changes away from 4005)
+-- Alias for backwards compatibility
+local function init_4005_hook()
+    init_fp_head_spawn_hook()
+end
+
+-- Unhook all bullet spawn hooks
 local function unhook_4005_hook()
     if wp4005_hook then
         wp4005_hook:unhook()
         wp4005_hook = nil
+    end
+    if shotgun_hook then
+        shotgun_hook:unhook()
+        shotgun_hook = nil
     end
 end
 
@@ -1331,15 +1474,70 @@ current_weapon_id = equip_weapon
 
 -- Force re-run updateReticles when switching to weapon 4005 (Minecart Handgun)
 -- This ensures the dot reticle is enabled even when the game auto-equips 4005 in minecart scene
+-- Manage FP head spawn hook based on FP mode state, Remake style, preset, and weapon
+local current_fp_active = rawget(_G, "standalone_first_person_active") == true
+local current_remake_style = static_center_dot == true
+
+-- Check if laser is disabled for current weapon (needed for multiple conditions)
+local weapon_id_str = current_weapon_id and tostring(current_weapon_id) or "unknown"
+local current_laser_disabled = weapon_laser_enabled[weapon_id_str] == false
+
+-- Check if iron sight is active + laser disabled (muzzle spawn, works without FP mode)
+local current_ironsight_active = rawget(_G, "standalone_iron_sight_active") == true
+local current_ironsight_laser_disabled = current_ironsight_active and current_laser_disabled
+
+-- Check if preset is active with laser-disabled weapon
+local preset_a = rawget(_G, "custom_aim_preset_a_active") == true
+local preset_b = rawget(_G, "custom_aim_preset_b_active") == true
+local preset_c = rawget(_G, "custom_aim_preset_c_active") == true
+local preset_d = rawget(_G, "custom_aim_preset_d_active") == true
+local current_any_preset = preset_a or preset_b or preset_c or preset_d
+local current_preset_laser_disabled = current_fp_active and current_laser_disabled and current_any_preset
+
+-- Check if Classic style + laser disabled (no preset required)
+local current_classic_laser_disabled = current_fp_active and (not current_remake_style) and current_laser_disabled
+
+-- Conditions for needing the hook:
+-- 1. Weapon 4005 (always needs hook)
+-- 2. FP mode + Remake style + preset active (head spawn)
+-- 3. FP mode + preset active + laser disabled (head spawn)
+-- 4. FP mode + Classic style + laser disabled (head spawn)
+-- 5. Iron sight + laser disabled (muzzle spawn, works without FP mode)
+local needs_hook_for_fp_remake = current_fp_active and current_remake_style and current_any_preset
+local prev_needed_hook_for_fp_remake = prev_fp_active_for_hook and prev_remake_style_for_hook and prev_any_preset_for_hook
+local needs_hook_now = needs_hook_for_fp_remake or current_preset_laser_disabled or current_classic_laser_disabled or current_ironsight_laser_disabled
+local prev_needed_hook = prev_needed_hook_for_fp_remake or prev_preset_laser_disabled_for_hook or prev_classic_laser_disabled_for_hook or prev_ironsight_laser_disabled_for_hook
+
+-- Initialize hook when:
+-- 1. Switching to weapon 4005
+-- 2. FP mode + Remake style just became active together
+-- 3. FP mode + preset + laser disabled just became active
 if current_weapon_id == 4005 and prev_weapon_id ~= 4005 then
   hasRunInitially = false
-  init_4005_hook()
+  init_fp_head_spawn_hook()
+elseif needs_hook_now and not prev_needed_hook then
+  -- Hook conditions just became active - initialize hook
+  init_fp_head_spawn_hook()
 end
 
--- Unhook 4005 when switching AWAY from 4005 (only on weapon change)
-if prev_weapon_id == 4005 and current_weapon_id ~= 4005 then
+-- Unhook when:
+-- 1. Hook conditions become inactive AND not on weapon 4005
+-- 2. Switching away from 4005 AND not needing hook
+if prev_needed_hook and not needs_hook_now and current_weapon_id ~= 4005 then
+  -- Hook conditions just became inactive and not on 4005
+  unhook_4005_hook()
+elseif prev_weapon_id == 4005 and current_weapon_id ~= 4005 and not needs_hook_now then
+  -- Switched away from 4005 and not needing hook
   unhook_4005_hook()
 end
+
+-- Update previous states for next frame
+prev_fp_active_for_hook = current_fp_active
+prev_remake_style_for_hook = current_remake_style
+prev_preset_laser_disabled_for_hook = current_preset_laser_disabled
+prev_classic_laser_disabled_for_hook = current_classic_laser_disabled
+prev_ironsight_laser_disabled_for_hook = current_ironsight_laser_disabled
+prev_any_preset_for_hook = current_any_preset
 
 -- Only check hooks if switching away from weapon 4600 (when hooks might be active)
 if prev_weapon_id == 4600 and current_weapon_id ~= 4600 and is_hooks_active then
@@ -1358,12 +1556,14 @@ if not cached_gun_obj or cached_weapon_id ~= equip_weapon or (current_time - cac
   cached_weapon_id = equip_weapon
   cache_refresh_time = current_time
 end
-if not cached_gun_obj then
+if not cached_gun_obj or not is_valid_managed(cached_gun_obj) then
   return
 end
 
-local bt_gun = cached_gun_obj:call("getComponent(System.Type)", sdk.typeof("chainsaw.Gun"))
-local bt_arms = cached_gun_obj:call("getComponent(System.Type)", sdk.typeof("chainsaw.Arms"))
+local ok_gun, bt_gun = pcall(cached_gun_obj.call, cached_gun_obj, "getComponent(System.Type)", sdk.typeof("chainsaw.Gun"))
+local ok_arms, bt_arms = pcall(cached_gun_obj.call, cached_gun_obj, "getComponent(System.Type)", sdk.typeof("chainsaw.Arms"))
+if not ok_gun then bt_gun = nil end
+if not ok_arms then bt_arms = nil end
 local muzzle_joint = nil
 if bt_arms then
   muzzle_joint = bt_arms:call("getMuzzleJoint")
@@ -1435,10 +1635,40 @@ local function update_static_dot_interpolation()
   local camera_rot = joint_get_rotation(camera_joint)
   local camera_forward = camera_rot:to_mat4()[2] * -1.0  -- Forward direction
 
-  -- Add camera offset for raycast origin (reduce to 0 in first person mode)
+  -- Check if FP mode is active
   local fp_active = rawget(_G, "standalone_first_person_active") == true
+  
+  -- In FP mode, use Head joint position for raycast origin instead of camera
+  local raycast_origin_pos = camera_pos
+  if fp_active then
+    local head_joint = get_player_head_joint()
+    if head_joint then
+      local head_pos = joint_get_position(head_joint)
+      if head_pos then
+        raycast_origin_pos = head_pos
+        
+        -- Apply head camera offset from FirstPersonMode (in head local space)
+        local fp_head_offset = rawget(_G, "standalone_fp_head_offset")
+        if fp_head_offset and (fp_head_offset.x ~= 0 or fp_head_offset.y ~= 0 or fp_head_offset.z ~= 0) then
+          local axis_x, axis_y, axis_z = nil, nil, nil
+          pcall(function() axis_x = head_joint:call("get_AxisX") end)
+          pcall(function() axis_y = head_joint:call("get_AxisY") end)
+          pcall(function() axis_z = head_joint:call("get_AxisZ") end)
+          
+          if axis_x and axis_y and axis_z then
+            local offset_world = (axis_x * fp_head_offset.x) + (axis_y * fp_head_offset.y) + (axis_z * fp_head_offset.z)
+            raycast_origin_pos = raycast_origin_pos + offset_world
+          else
+            raycast_origin_pos = raycast_origin_pos + Vector3f.new(fp_head_offset.x, fp_head_offset.y, fp_head_offset.z)
+          end
+        end
+      end
+    end
+  end
+  
+  -- Add camera offset for raycast origin (reduce to 0 in first person mode)
   local raycast_offset = fp_active and 0.0 or CAMERA_RAYCAST_OFFSET
-  local offset_camera_pos = camera_pos + (camera_forward * raycast_offset)
+  local offset_camera_pos = raycast_origin_pos + (camera_forward * raycast_offset)
   
   -- Calculate end point like working crosshair
   local cam_end = offset_camera_pos + (camera_forward * 8192.0)
@@ -1470,33 +1700,33 @@ local function update_static_dot_interpolation()
         
         -- If contact distance is very far (sky/skybox), use default distance instead
         local sky_distance_threshold = 100.0  -- Treat anything beyond 100m as "sky"
-        local actual_distance = contact_distance or (contact_position - camera_pos):length()
+        local actual_distance = contact_distance or (contact_position - raycast_origin_pos):length()
         
         if actual_distance > sky_distance_threshold then
           -- Aiming at sky or very far away - use default distance
-          static_target_intersection_point = camera_pos + (camera_forward * sky_distance_threshold)
+          static_target_intersection_point = raycast_origin_pos + (camera_forward * sky_distance_threshold)
         else
           -- Apply surface offset from contact point (using unified constant)
           local new_target_intersection = contact_position - (camera_forward * SURFACE_OFFSET)
           
-          -- Hard limit: ensure dot never goes closer than 1.5 meters from camera
-          local min_distance_from_camera = 1.5
-          local camera_to_dot = new_target_intersection - camera_pos
-          local distance_from_camera = camera_to_dot:length()
-          if distance_from_camera < min_distance_from_camera then
-            static_target_intersection_point = camera_pos + (camera_forward * min_distance_from_camera)
+          -- Hard limit: ensure dot never goes closer than 1.5 meters from raycast origin
+          local min_distance_from_origin = 1.5
+          local origin_to_dot = new_target_intersection - raycast_origin_pos
+          local distance_from_origin = origin_to_dot:length()
+          if distance_from_origin < min_distance_from_origin then
+            static_target_intersection_point = raycast_origin_pos + (camera_forward * min_distance_from_origin)
           else
             static_target_intersection_point = new_target_intersection
           end
         end
       else
         -- Contact point was nil - use default distance
-        static_target_intersection_point = camera_pos + (camera_forward * 100.0)
+        static_target_intersection_point = raycast_origin_pos + (camera_forward * 100.0)
       end
     else
       -- No contact point found (aiming at sky/empty space) - use default distance
       local default_distance = 100.0  -- Default distance when no collision
-      local fallback_position = camera_pos + (camera_forward * default_distance)
+      local fallback_position = raycast_origin_pos + (camera_forward * default_distance)
       static_target_intersection_point = fallback_position
     end
     
@@ -1517,23 +1747,36 @@ local function update_laser_trail()
 -- Only show the laser trail if aiming, enabled, and has valid muzzle
 -- Hide trail when simple static mode is enabled AND laser is toggled off (showing backup dot)
 -- Hide trail when static mode is enabled and there's no new muzzle data
+
+-- Skip drawing for several frames after mode switch to prevent stale position flash
+if skip_trail_frames > 0 then
+  skip_trail_frames = skip_trail_frames - 1
+  if laser_trail_gameobject then
+    laser_trail_gameobject:set_DrawSelf(false)
+  end
+  return
+end
+
 -- Check if laser is enabled for current weapon (default to enabled if not set)
 local weapon_id_str = tostring(current_weapon_id)
 local laser_enabled_for_weapon = weapon_laser_enabled[weapon_id_str] ~= false  -- Default true if nil
 local has_stale_muzzle_data = static_center_dot and (os.clock() - last_crosshair_time) > 0.25
 local is_weapon_changing = _G._IsWeaponChanging == true
 
+-- Check if current weapon is a knife (ID in 5000 range) - instantly disable trail for knives
+local is_knife_weapon = current_weapon_id and current_weapon_id >= 5000 and current_weapon_id < 6000
+
 -- Weapon 4005 always uses simple static mode internally
 local effective_simple_static = simple_static_mode or (current_weapon_id == 4005)
-local should_show = enable_laser_trail and re4.last_muzzle_pos and not is_non_muzzle_weapon and _G.is_aim and not (effective_simple_static and not show_laser_dot) and not has_stale_muzzle_data and laser_enabled_for_weapon and not is_weapon_changing
+local should_show = enable_laser_trail and re4.last_muzzle_pos and not is_non_muzzle_weapon and _G.is_aim and not (effective_simple_static and not show_laser_dot) and not has_stale_muzzle_data and laser_enabled_for_weapon and not is_weapon_changing and not is_knife_weapon
 
 -- Update last active time when trail should be shown
 if should_show then
   last_laser_trail_active_time = os.clock()
 end
 
--- Use 0.15-second grace period after stopping aim
-local within_grace_period = (os.clock() - last_laser_trail_active_time) < 0.15
+-- Use 0.15-second grace period after stopping aim, but NOT for knife weapons (instant disable)
+local within_grace_period = not is_knife_weapon and (os.clock() - last_laser_trail_active_time) < 0.15
 
 if not should_show and not within_grace_period then
   if laser_trail_gameobject then
@@ -1573,13 +1816,22 @@ local offset_z = offset_tbl.z or 0.0
 local adjusted_muzzle_pos = re4.last_muzzle_pos
 
 if current_muzzle_joint then
-  local axis_x = current_muzzle_joint:call("get_AxisX")
-  local axis_y = current_muzzle_joint:call("get_AxisY")
-  local axis_z = current_muzzle_joint:call("get_AxisZ")
-  adjusted_muzzle_pos = adjusted_muzzle_pos
-    + (axis_x * offset_x)
-    + (axis_y * offset_y)
-    + (axis_z * offset_z)
+  local success, axis_x = pcall(function() return current_muzzle_joint:call("get_AxisX") end)
+  if success and axis_x then
+    local axis_y = current_muzzle_joint:call("get_AxisY")
+    local axis_z = current_muzzle_joint:call("get_AxisZ")
+    adjusted_muzzle_pos = adjusted_muzzle_pos
+      + (axis_x * offset_x)
+      + (axis_y * offset_y)
+      + (axis_z * offset_z)
+  else
+    -- Muzzle joint became invalid, use simple offset
+    adjusted_muzzle_pos = Vector3f.new(
+      re4.last_muzzle_pos.x + offset_x,
+      re4.last_muzzle_pos.y + offset_y,
+      re4.last_muzzle_pos.z + offset_z
+    )
+  end
 else
   adjusted_muzzle_pos = Vector3f.new(
     re4.last_muzzle_pos.x + offset_x,
@@ -1676,13 +1928,12 @@ end
 local force_classic = (_G.force_classic_re4_style == true)
 local fp_active = (rawget(_G, "standalone_first_person_active") == true)
 
--- When using first person mode with preset A or B active, also force Classic RE4 Style
+-- Track preset state for hook management (no longer forces Classic style)
 local preset_a_active = (rawget(_G, "custom_aim_preset_a_active") == true)
 local preset_b_active = (rawget(_G, "custom_aim_preset_b_active") == true)
 local preset_c_active = (rawget(_G, "custom_aim_preset_c_active") == true)
 local preset_d_active = (rawget(_G, "custom_aim_preset_d_active") == true)
 local any_preset_active_now = preset_a_active or preset_b_active or preset_c_active or preset_d_active
-local fp_preset_ab_force_classic = fp_active and any_preset_active_now
 
 -- Track iron sight active state (aiming) to update hooks when aiming starts/stops
 local iron_sight_active_now = (rawget(_G, "standalone_iron_sight_active") == true)
@@ -1716,13 +1967,18 @@ end
 
 -- Handle force_classic separately for static_center_dot restoration
 -- This allows restoring RE4 Remake Style when iron sight is toggled off, even if FP mode is still active
--- Also force Classic RE4 Style when first person mode + preset A or B is active
-local should_force_classic = force_classic or fp_preset_ab_force_classic
+-- Note: FP mode + preset no longer forces Classic style (head spawn handled separately)
+local should_force_classic = force_classic
 if should_force_classic then
   if not force_classic_re4_prev then
     -- Just entered force_classic - store current state and update hooks for IronSight/Preset override
     stored_static_center_dot = static_center_dot
     manage_hooks(true)  -- Check if we need to hook for laser-disabled weapons
+    -- Skip frames if was in Remake style (static_center_dot was true) - prevents stale position flash
+    -- Applies to both FP mode (preset switch) and non-FP mode (iron sight toggle)
+    if static_center_dot then
+      skip_trail_frames = 5
+    end
   end
   if static_center_dot then
     static_center_dot = false
@@ -1735,6 +1991,11 @@ else
   if force_classic_re4_prev then
     -- Just exited force_classic - restore previous state and update hooks
     manage_hooks(true)  -- Check if we need to unhook for laser-disabled weapons
+    -- Skip frames if restoring to Remake style - prevents stale position flash
+    -- Applies to both FP mode (preset switch) and non-FP mode (iron sight toggle)
+    if stored_static_center_dot == true then
+      skip_trail_frames = 5
+    end
     if stored_static_center_dot ~= nil and static_center_dot ~= stored_static_center_dot then
       static_center_dot = stored_static_center_dot
       update_spawn_flag()
@@ -1814,6 +2075,17 @@ end
 
 -- Update the re.on_pre_gui_draw_element function to respect show_laser_dot
 re.on_pre_gui_draw_element(function(element, context)
+  -- Get game object and name once, reuse throughout function
+  local game_object = element:call("get_GameObject")
+  local name = game_object and game_object:call("get_Name")
+  
+  -- Skip drawing dot for several frames after mode switch to prevent stale position flash
+  if skip_trail_frames > 0 then
+    if reticle_names[name] then
+      return false  -- Block reticle drawing during frame skip
+    end
+  end
+  
   -- Use 0.15s grace period matching the trail
   -- Weapon 4005 (Minecart Handgun) always processes reticle regardless of aim state
   local within_grace_period = (os.clock() - last_laser_trail_active_time) < 0.15
@@ -1821,9 +2093,6 @@ re.on_pre_gui_draw_element(function(element, context)
   if not force_process_4005 and not _G.is_aim and not within_grace_period then
     return true
   end
-  
-  local game_object = element:call("get_GameObject")
-  local name = game_object and game_object:call("get_Name")
   
   -- Check if laser is enabled for current weapon (default to enabled if not set)
   local weapon_id_str = tostring(current_weapon_id)
