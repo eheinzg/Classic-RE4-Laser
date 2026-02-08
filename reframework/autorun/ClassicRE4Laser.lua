@@ -241,23 +241,39 @@ local function register_spread_target(move_info, weapon_id)
 end
 
 -- Register spread targets from shell userdata (recursively finds _MoveInfo objects)
--- Register spread targets from shell userdata (recursively finds _MoveInfo objects)
 local function register_spread_targets_from_shell(shell_userdata, weapon_id)
   if not shell_userdata or not is_valid_managed(shell_userdata) then
     return
   end
+
+  local visited_candidates = {}
 
   local function handle_candidate(candidate)
     if candidate == nil then
       return
     end
 
-    if type(candidate) == "table" then
+    local candidate_type = type(candidate)
+
+    if candidate_type == "table" then
+      if visited_candidates[candidate] then
+        return
+      end
+      visited_candidates[candidate] = true
       for _, element in ipairs(candidate) do
         handle_candidate(element)
       end
       return
     end
+
+    if candidate_type ~= "userdata" then
+      return
+    end
+
+    if visited_candidates[candidate] then
+      return
+    end
+    visited_candidates[candidate] = true
 
     if not is_valid_managed(candidate) then
       return
@@ -295,7 +311,8 @@ local function register_spread_targets_from_shell(shell_userdata, weapon_id)
     end
 
     if not iterator_success then
-      local fields = candidate:get_type_definition():get_fields()
+      local type_def = candidate:get_type_definition()
+      local fields = type_def and type_def:get_fields() or nil
       if fields then
         for _, field in ipairs(fields) do
           if field:get_name():match("ShellInfoUserData") then
@@ -866,9 +883,9 @@ local function on_pre_request_fire_4005(args)
     local use_head_for_classic_laser_disabled = is_classic_style and laser_disabled
     
     -- Determine if we should modify bullet spawn at all
-    -- Remake style only uses head spawn when a preset is active
-    local use_head_for_remake_preset = is_remake_style and any_preset_active
-    local should_use_head = use_head_for_preset_laser_disabled or use_head_for_classic_laser_disabled or is_4005 or use_head_for_remake_preset
+    -- Remake style uses head spawn in FP mode (ironsight handled above)
+    local use_head_for_remake = is_remake_style
+    local should_use_head = use_head_for_preset_laser_disabled or use_head_for_classic_laser_disabled or is_4005 or use_head_for_remake
     if not should_use_head then return end
     
     -- Get head joint for spawn position
@@ -1499,12 +1516,12 @@ local current_classic_laser_disabled = current_fp_active and (not current_remake
 
 -- Conditions for needing the hook:
 -- 1. Weapon 4005 (always needs hook)
--- 2. FP mode + Remake style + preset active (head spawn)
+-- 2. FP mode + Remake style (head spawn)
 -- 3. FP mode + preset active + laser disabled (head spawn)
 -- 4. FP mode + Classic style + laser disabled (head spawn)
 -- 5. Iron sight + laser disabled (muzzle spawn, works without FP mode)
-local needs_hook_for_fp_remake = current_fp_active and current_remake_style and current_any_preset
-local prev_needed_hook_for_fp_remake = prev_fp_active_for_hook and prev_remake_style_for_hook and prev_any_preset_for_hook
+local needs_hook_for_fp_remake = current_fp_active and current_remake_style
+local prev_needed_hook_for_fp_remake = prev_fp_active_for_hook and prev_remake_style_for_hook
 local needs_hook_now = needs_hook_for_fp_remake or current_preset_laser_disabled or current_classic_laser_disabled or current_ironsight_laser_disabled
 local prev_needed_hook = prev_needed_hook_for_fp_remake or prev_preset_laser_disabled_for_hook or prev_classic_laser_disabled_for_hook or prev_ironsight_laser_disabled_for_hook
 
@@ -1546,12 +1563,49 @@ end
 
 -- Use cached weapon object or refresh if weapon changed
 if not cached_gun_obj or cached_weapon_id ~= equip_weapon or (current_time - cache_refresh_time) > cache_refresh_interval then
-  cached_gun_obj = scene:call("findGameObject(System.String)", "wp" .. tostring(equip_weapon))
+  cached_gun_obj = nil
+  local weapon_name = "wp" .. tostring(equip_weapon)
+
+  -- For wp4002, walk ch0a0z0_body direct children to find the player's weapon
+  -- This avoids picking up an NPC's duplicate wp4002 via findGameObject
+  if equip_weapon == 4002 then
+    local player_body_go = re4 and re4.body or nil
+    if not player_body_go and scene then
+      local ok_find, found = pcall(scene.call, scene, "findGameObject(System.String)", "ch0a0z0_body")
+      if ok_find then player_body_go = found end
+    end
+    if player_body_go and is_valid_managed(player_body_go) then
+      local ok_tf, body_tf = pcall(player_body_go.get_Transform, player_body_go)
+      if ok_tf and body_tf then
+        local ok_ch, child = pcall(body_tf.call, body_tf, "get_Child")
+        child = ok_ch and child or nil
+        local safety = 0
+        while child and safety < 50 do
+          local ok_go, child_go = pcall(child.call, child, "get_GameObject")
+          if ok_go and child_go then
+            local ok_cn, child_name = pcall(child_go.call, child_go, "get_Name")
+            if ok_cn and child_name and tostring(child_name) == weapon_name then
+              cached_gun_obj = child_go
+              break
+            end
+          end
+          local ok_next, next_sib = pcall(child.call, child, "get_Next")
+          child = ok_next and next_sib or nil
+          safety = safety + 1
+        end
+      end
+    end
+  end
+
+  -- Fallback: standard findGameObject (works for all non-duplicate weapons)
   if not cached_gun_obj then
-    cached_gun_obj = scene:call("findGameObject(System.String)", "wp" .. tostring(equip_weapon) .. "_AO")
+    cached_gun_obj = scene:call("findGameObject(System.String)", weapon_name)
   end
   if not cached_gun_obj then
-    cached_gun_obj = scene:call("findGameObject(System.String)", "wp" .. tostring(equip_weapon) .. "_MC")
+    cached_gun_obj = scene:call("findGameObject(System.String)", weapon_name .. "_AO")
+  end
+  if not cached_gun_obj then
+    cached_gun_obj = scene:call("findGameObject(System.String)", weapon_name .. "_MC")
   end
   cached_weapon_id = equip_weapon
   cache_refresh_time = current_time
