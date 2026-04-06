@@ -1817,8 +1817,8 @@ local laser_enabled_for_weapon = weapon_laser_enabled[weapon_id_str] ~= false  -
 local has_stale_muzzle_data = static_center_dot and (os.clock() - last_crosshair_time) > 0.25
 local is_weapon_changing = _G._IsWeaponChanging == true
 
--- Check if current weapon is a knife (ID in 5000 range) - instantly disable trail for knives
-local is_knife_weapon = current_weapon_id and current_weapon_id >= 5000 and current_weapon_id < 6000
+-- Check if current weapon is a knife (5000 range + specific knife IDs) - instantly disable trail for knives
+local is_knife_weapon = current_weapon_id and ((current_weapon_id >= 5000 and current_weapon_id < 6000) or current_weapon_id == 6107)
 
 -- Weapon 4005 always uses simple static mode internally
 local effective_simple_static = simple_static_mode or (current_weapon_id == 4005)
