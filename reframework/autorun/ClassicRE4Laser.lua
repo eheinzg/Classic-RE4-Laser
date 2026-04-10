@@ -32,7 +32,19 @@ local changed = false
 local wc = false
 
 local show_laser_dot = true -- Controls dot/crosshair visibility
+local show_per_weapon_popup = false -- Per-weapon laser popup window open state
 local hide_dot_when_no_muzzle = false -- Hide reticle/dot when no muzzle is found
+local show_default_crosshair_laser_off = true -- Show game's default crosshair when laser is disabled for a weapon (default on)
+
+local default_crosshair_color_array = {1.0, 1.0, 1.0, 1.0} -- RGBA for crosshair when laser is off + show default crosshair
+local default_crosshair_match_laser = false -- Use laser dot color instead of custom crosshair color
+local default_crosshair_saturation =1.0 -- Glow/saturation for the default crosshair
+local default_crosshair_view_type = 1 -- combo: 0 = 3D Crosshair, 1 = Default
+local default_crosshair_overlay = true
+local default_crosshair_detonemap = true
+local default_crosshair_depth_test = false
+
+-- Debug DrawView overrides (applied after normal logic when enabled)
 
 re4.crosshair_pos = Vector3f.new(0, 0, 0)
 re4.crosshair_normal = Vector3f.new(0, 0, 0)
@@ -427,8 +439,8 @@ local scene_manager = nil
 local gui_initialized = false
 local minRange = 0
 local maxRange = 5
-dot_scale = 0.85  -- Default dot scale
-knife_dot_scale = 0.85  -- Default knife dot scale
+dot_scale = 1.0  -- Default dot scale
+knife_dot_scale = 1.0  -- Default knife dot scale
 local min_scale = 0.3
 local max_scale = 1.25
 local config_file = "ClassicLaser\\LaserSettings.json"
@@ -494,6 +506,20 @@ local weapon_categories = {
     {name = "Special", ids = {4600, 4900, 4901, 4902, 6106, 6111}},
 }
 
+-- Crosshair type dropdown: same table + order as imgui.combo (REFramework uses 0-based combo index).
+local CROSSHAIR_TYPE_COMBO_LABELS = {"3D Crosshair", "Default"}
+
+-- Match visible dropdown row (same index rule as imgui.combo for this script).
+local function crosshair_combo_shows_default_crosshair()
+  local i = default_crosshair_view_type
+  return CROSSHAIR_TYPE_COMBO_LABELS[i + 1] == "Default"
+end
+
+-- Opposite of default-crosshair selection (same index rule as crosshair_combo_shows_default_crosshair).
+local function crosshair_combo_shows_3d_crosshair()
+  return not crosshair_combo_shows_default_crosshair()
+end
+
 -- Per-weapon laser trail enable (default all enabled)
 local weapon_laser_enabled = {}
 
@@ -526,6 +552,7 @@ local cached_static_camera_pos = nil  -- Cache for camera position used in stati
 local static_attack_ray_result = nil  -- Persistent ray result for attack layer
 local static_bullet_ray_result = nil  -- Persistent ray result for bullet layer
 local stored_static_center_dot = nil  -- Cache user preference when forced overrides run
+local stored_classic_for_default_crosshair = nil  -- Cache classic style when 3D Crosshair + laser toggle forces remake
 local force_classic_re4_prev = false  -- Track previous force state to restore preference
 local any_preset_active_prev = false  -- Track previous preset state to update hooks when presets change
 local skip_trail_frames = 0  -- Frame counter to skip drawing trail after mode switch
@@ -615,6 +642,7 @@ local cached_laser_sight_obj = nil
 local cache_refresh_time = 0
 local cache_refresh_interval = 1.0  -- Refresh cache every 1 second
 local is_non_muzzle_weapon = false
+local _dot_panel_field = "TYPE01Panel"
 
 -- Global variable to track hold variation state
 local is_hold_variation = false
@@ -1036,7 +1064,15 @@ local function save_config()
       crosshair_saturation = crosshair_saturation,
       static_center_dot = static_center_dot,  -- Add this line
       simple_static_mode = simple_static_mode,  -- Add simple static mode
-      hide_dot_when_no_muzzle = hide_dot_when_no_muzzle,  -- Hide dot when no muzzle found
+      hide_dot_when_no_muzzle = hide_dot_when_no_muzzle,
+      show_default_crosshair_laser_off = show_default_crosshair_laser_off,
+      default_crosshair_color_array = default_crosshair_color_array,
+      default_crosshair_match_laser = default_crosshair_match_laser,
+      default_crosshair_saturation = default_crosshair_saturation,
+      default_crosshair_view_type = default_crosshair_view_type,
+      default_crosshair_overlay = default_crosshair_overlay,
+      default_crosshair_detonemap = default_crosshair_detonemap,
+      default_crosshair_depth_test = default_crosshair_depth_test,
       enable_laser_trail = enable_laser_trail,  -- Add laser trail settings
       laser_trail_scale = laser_trail_scale,
       knife_dot_scale = knife_dot_scale,  -- Add knife dot scale
@@ -1140,8 +1176,20 @@ local function load_config()
   dot_color_b = data.dot_color_b or dot_color_b
   crosshair_saturation = data.crosshair_saturation or crosshair_saturation
   static_center_dot = data.static_center_dot or static_center_dot
-  simple_static_mode = data.simple_static_mode or simple_static_mode
+  simple_static_mode = false -- disabled; always override any saved value
   hide_dot_when_no_muzzle = data.hide_dot_when_no_muzzle or hide_dot_when_no_muzzle
+  if data.show_default_crosshair_laser_off ~= nil then
+    show_default_crosshair_laser_off = data.show_default_crosshair_laser_off
+  end
+  if data.default_crosshair_color_array then
+    default_crosshair_color_array = sanitize_color_array(data.default_crosshair_color_array, default_crosshair_color_array)
+  end
+  if data.default_crosshair_match_laser ~= nil then default_crosshair_match_laser = data.default_crosshair_match_laser end
+  if data.default_crosshair_saturation ~= nil then default_crosshair_saturation = data.default_crosshair_saturation end
+  if data.default_crosshair_view_type ~= nil then default_crosshair_view_type = data.default_crosshair_view_type end
+  if data.default_crosshair_overlay ~= nil then default_crosshair_overlay = data.default_crosshair_overlay end
+  if data.default_crosshair_detonemap ~= nil then default_crosshair_detonemap = data.default_crosshair_detonemap end
+  if data.default_crosshair_depth_test ~= nil then default_crosshair_depth_test = data.default_crosshair_depth_test end
   enable_laser_trail = data.enable_laser_trail or enable_laser_trail
   laser_trail_scale = data.laser_trail_scale or laser_trail_scale
   knife_dot_scale = data.knife_dot_scale or knife_dot_scale
@@ -1488,6 +1536,7 @@ end
 -- Store weapon ID globally for laser trail offset calculations
 local prev_weapon_id = current_weapon_id
 current_weapon_id = equip_weapon
+_dot_panel_field = (equip_weapon == 6304) and "TYPE08Panel" or "TYPE01Panel"
 
 -- Force re-run updateReticles when switching to weapon 4005 (Minecart Handgun)
 -- This ensures the dot reticle is enabled even when the game auto-equips 4005 in minecart scene
@@ -1623,9 +1672,11 @@ if bt_arms then
   muzzle_joint = bt_arms:call("getMuzzleJoint")
 end
 if not muzzle_joint then
-  local gun_transforms = cached_gun_obj:get_Transform()
+  local ok_gt, gun_transforms = pcall(cached_gun_obj.get_Transform, cached_gun_obj)
+  if not ok_gt then gun_transforms = nil end
   if gun_transforms then
-    muzzle_joint = gun_transforms:call("getJointByName", "vfx_muzzle")
+    local ok_j, j = pcall(gun_transforms.call, gun_transforms, "getJointByName", "vfx_muzzle")
+    muzzle_joint = ok_j and j or nil
   end
 end
 
@@ -2104,6 +2155,21 @@ if KM_controls or PAD_controls then
     -- Clear grace period timer when toggling off to ensure immediate disappearance
     if not enable_laser_trail then
       last_laser_trail_active_time = 0
+      reticle_needs_restore = true
+    end
+    -- Classic→Remake only when the dropdown shows "3D Crosshair"; not when it shows "Default"
+    if crosshair_combo_shows_3d_crosshair() then
+      if not enable_laser_trail and not static_center_dot then
+        stored_classic_for_default_crosshair = true
+        static_center_dot = true
+        update_spawn_flag()
+        hasRunInitially = false
+      elseif enable_laser_trail and stored_classic_for_default_crosshair then
+        static_center_dot = false
+        stored_classic_for_default_crosshair = nil
+        update_spawn_flag()
+        hasRunInitially = false
+      end
     end
     if laser_trail_gameobject then
       laser_trail_gameobject:set_DrawSelf(enable_laser_trail)
@@ -2120,6 +2186,354 @@ for i, v in ipairs(reticle_names) do
 reticle_names[v] = true
 end
 
+-- Cached type references for reticle panel visibility override
+local T_RETICLE_GUI_BEHAVIOR = sdk.typeof("chainsaw.ReticleGuiBehavior")
+local T_SCENE_MANAGER_DEF = sdk.find_type_definition("via.SceneManager")
+
+local ALL_TYPE_PANEL_FIELDS = {
+    "TYPE00Panel","TYPE01Panel","TYPE02Panel","TYPE04Panel","TYPE05Panel",
+    "TYPE06Panel","TYPE07Panel","TYPE08Panel","TYPE09Panel","TYPE10Panel","TYPE90Panel"
+}
+
+-- When set true, a one-shot restore pass hides all TYPE panels so the game's
+-- own lateUpdate can reassert the correct weapon panel on the next frame.
+local reticle_needs_restore = false
+
+-- Restore all TYPE01Panel GUI children to visible (undo line-hiding)
+local function restore_type01_children(behavior)
+    pcall(function()
+        local t01 = behavior:get_field(_dot_panel_field)
+        if not t01 then return end
+        local children = {}
+        pcall(function()
+            local n = t01:call("get_ChildNum")
+            for i = 0, math.min((n or 0) - 1, 2) do
+                local c = t01:call("get_Child(System.Int32)", i)
+                if c then table.insert(children, c) end
+            end
+        end)
+        if #children == 0 then
+            pcall(function()
+                local c = t01:call("get_Child")
+                while c and #children < 3 do
+                    table.insert(children, c)
+                    c = c:call("get_Next")
+                end
+            end)
+        end
+        for _, c in ipairs(children) do
+            pcall(function() c:call("set_Visible", true) end)
+        end
+    end)
+end
+
+--[[ # log (commented out)
+local _dbg_log_path = "reframework/autorun/debug-6aaffa.log"
+local _dbg_log_count = 0
+local _dbg_log_max = 120
+local _dbg_last_wpn = nil
+local function _dbg_log(hypothesis, location, message, data)
+    if _dbg_log_count >= _dbg_log_max then return end
+    _dbg_log_count = _dbg_log_count + 1
+    local entry = '{"sessionId":"6aaffa","hypothesisId":"' .. tostring(hypothesis) .. '","location":"' .. tostring(location) .. '","message":"' .. tostring(message) .. '"'
+    if data then
+        entry = entry .. ',"data":{'
+        local first = true
+        for k, v in pairs(data) do
+            if not first then entry = entry .. ',' end
+            entry = entry .. '"' .. tostring(k) .. '":"' .. tostring(v) .. '"'
+            first = false
+        end
+        entry = entry .. '}'
+    end
+    entry = entry .. ',"timestamp":' .. tostring(os.clock()) .. '}\n'
+    local f = io.open(_dbg_log_path, "a")
+    if f then f:write(entry) f:close() end
+end
+--]] -- #endregion
+
+local function apply_type10_visibility(behavior)
+    local target_panel = _dot_panel_field
+    if current_weapon_id == 6304 then
+        pcall(function()
+            local p = behavior:get_field(target_panel)
+            if p then p:call("set_Visible", true) end
+        end)
+        return
+    end
+    --[[ # log (commented out)
+    local t10_field = nil
+    local t10_vis_before = nil
+    local t10_vis_after = nil
+    local cwp_vis_before = nil
+    local cwp_vis_after = nil
+    local cwp_field = nil
+    local panel_count = 0
+    local nil_panels = 0
+    --]] -- #endregion
+    for _, tn in ipairs(ALL_TYPE_PANEL_FIELDS) do
+        pcall(function()
+            local p = behavior:get_field(tn)
+            if p then
+                --[[ # log (commented out)
+                panel_count = panel_count + 1
+                if tn == "TYPE01Panel" then
+                    t10_field = tostring(p)
+                    local ok_v, vis = pcall(function() return p:call("get_Visible") end)
+                    t10_vis_before = ok_v and tostring(vis) or "err"
+                end
+                --]] -- #endregion
+                p:call("set_Visible", tn == target_panel)
+                --[[ # log (commented out)
+                if tn == "TYPE01Panel" then
+                    local ok_v2, vis2 = pcall(function() return p:call("get_Visible") end)
+                    t10_vis_after = ok_v2 and tostring(vis2) or "err"
+                end
+                --]] -- #endregion
+            --[[ else
+                -- # log (commented out)
+                nil_panels = nil_panels + 1
+                -- #endregion --]]
+            end
+        end)
+    end
+    -- Also explicitly hide CurrWeaponPanel if it differs from TYPE01Panel
+    pcall(function()
+        local cwp = behavior:get_field("CurrWeaponPanel")
+        local t10 = behavior:get_field(target_panel)
+        --[[ # log (commented out)
+        cwp_field = tostring(cwp)
+        local ok_cv, cv = pcall(function() return cwp and cwp:call("get_Visible") end)
+        cwp_vis_before = ok_cv and tostring(cv) or "err"
+        --]] -- #endregion
+        if cwp and t10 and tostring(cwp) ~= tostring(t10) then
+            cwp:call("set_Visible", false)
+        end
+        --[[ # log (commented out)
+        local ok_cv2, cv2 = pcall(function() return cwp and cwp:call("get_Visible") end)
+        cwp_vis_after = ok_cv2 and tostring(cv2) or "err"
+        --]] -- #endregion
+    end)
+    --[[ # log (commented out)
+    _dbg_log("H3_H4", "apply_type10_visibility", "panel_stats", {
+        panel_count=panel_count, nil_panels=nil_panels,
+        t10_field=tostring(t10_field), t10_vis_before=tostring(t10_vis_before), t10_vis_after=tostring(t10_vis_after),
+        cwp_field=tostring(cwp_field), cwp_vis_before=tostring(cwp_vis_before), cwp_vis_after=tostring(cwp_vis_after)
+    })
+    --]] -- #endregion
+    pcall(function()
+        local dot_panel = behavior:get_field(target_panel)
+        if not dot_panel then return end
+        local children = {}
+        local ok_enum, err_enum = pcall(function()
+            local n = dot_panel:call("get_ChildNum")
+            for i = 0, math.min((n or 0) - 1, 2) do
+                local c = dot_panel:call("get_Child(System.Int32)", i)
+                if c then table.insert(children, c) end
+            end
+        end)
+        if #children == 0 then
+            pcall(function()
+                local c = dot_panel:call("get_Child")
+                while c and #children < 3 do
+                    table.insert(children, c)
+                    c = c:call("get_Next")
+                end
+            end)
+        end
+        for i, c in ipairs(children) do
+            pcall(function() c:call("set_Visible", i == 1) end)
+        end
+    end)
+end
+
+local function for_each_reticle_behavior_in_scene(callback)
+    if not T_RETICLE_GUI_BEHAVIOR then return end
+    local sm = sdk.get_native_singleton("via.SceneManager")
+    if not sm or not T_SCENE_MANAGER_DEF then return end
+    local cur_scene = sdk.call_native_func(sm, T_SCENE_MANAGER_DEF, "get_CurrentScene")
+    if not cur_scene then return end
+    for _, go_name in ipairs(reticle_names) do
+        pcall(function()
+            local go = cur_scene:call("findGameObject(System.String)", go_name)
+            --[[ # log (commented out)
+            _dbg_log("H1", "for_each_reticle", "findGameObject", {go_name=go_name, found=tostring(go ~= nil)})
+            --]] -- #endregion
+            if not go then return end
+            local b = go:call("getComponent(System.Type)", T_RETICLE_GUI_BEHAVIOR)
+            --[[ # log (commented out)
+            _dbg_log("H2", "for_each_reticle", "getComponent", {go_name=go_name, behavior_found=tostring(b ~= nil)})
+            --]] -- #endregion
+            if b then callback(b) end
+        end)
+    end
+end
+
+-- Undo panel forcing: restore all children visible, show CurrWeaponPanel, hide the dot panel
+local function undo_type10_override(behavior)
+    restore_type01_children(behavior)
+    pcall(function()
+        local dp = behavior:get_field(_dot_panel_field)
+        if dp then dp:call("set_Visible", false) end
+        local cwp = behavior:get_field("CurrWeaponPanel")
+        if cwp then cwp:call("set_Visible", true) end
+    end)
+end
+
+local function apply_reticle_panel_override()
+    if reticle_needs_restore then
+        reticle_needs_restore = false
+        for_each_reticle_behavior_in_scene(undo_type10_override)
+        return
+    end
+    -- Try to activate the reticle by probing _IsEnableOpen and calling open mechanisms
+    pcall(function()
+        local sm = sdk.get_native_singleton("via.SceneManager")
+        if not sm or not T_SCENE_MANAGER_DEF then return end
+        local cur_scene = sdk.call_native_func(sm, T_SCENE_MANAGER_DEF, "get_CurrentScene")
+        if not cur_scene then return end
+        for _, go_name in ipairs(reticle_names) do
+            pcall(function()
+                local go = cur_scene:call("findGameObject(System.String)", go_name)
+                if not go then return end
+                local b = go:call("getComponent(System.Type)", T_RETICLE_GUI_BEHAVIOR)
+                if not b then return end
+                local is_enable_open = b:call("get__IsEnableOpen")
+                local go_draw = go:call("get_Draw")
+                local curr_step = b:call("get_CurrStep")
+                local curr_target_wpn = b:call("get_CurrTargetWeaponID")
+                --[[ # log (commented out)
+                _dbg_log("H13", "apply_override", "open_state_probe", {
+                    go_name=go_name,
+                    is_enable_open=tostring(is_enable_open),
+                    go_draw=tostring(go_draw),
+                    curr_step=tostring(curr_step),
+                    curr_target_wpn=tostring(curr_target_wpn)
+                })
+                --]] -- #endregion
+            end)
+        end
+    end)
+    local weapon_id_str = current_weapon_id and tostring(current_weapon_id) or "unknown"
+    local laser_on = weapon_laser_enabled[weapon_id_str] ~= false
+    local is_knife = current_weapon_id and ((current_weapon_id >= 5000 and current_weapon_id < 6000) or current_weapon_id == 6107)
+    --[[ # log (commented out)
+    local _wpn_changed = (tostring(current_weapon_id) ~= tostring(_dbg_last_wpn))
+    if _wpn_changed or _dbg_log_count < 5 then
+        _dbg_last_wpn = current_weapon_id
+        _dbg_log("H5", "apply_reticle_panel_override", "entry", {
+            weapon_id=tostring(current_weapon_id), laser_on=tostring(laser_on),
+            is_knife=tostring(is_knife), is_non_muzzle=tostring(is_non_muzzle_weapon),
+            enable_laser_trail=tostring(enable_laser_trail), will_skip=tostring(is_knife == true)
+        })
+    end
+    --]] -- #endregion
+    if is_knife then return end
+    -- Blast Crossbow (6102) uses its own reticle panel --
+    -- undo any leftover TYPE01 forcing so the native panel shows, but never apply it.
+    if current_weapon_id == 6102 then
+        for_each_reticle_behavior_in_scene(undo_type10_override)
+        return
+    end
+    -- 6304's dot panel (TYPE08) is on a Gui_ui2040 that findGameObject can't reach;
+    -- the draw callback handles it via apply_type10_visibility directly.
+    if current_weapon_id == 6304 then return end
+    if not laser_on or not enable_laser_trail then
+        if show_default_crosshair_laser_off then
+            for_each_reticle_behavior_in_scene(undo_type10_override)
+        else
+            for_each_reticle_behavior_in_scene(restore_type01_children)
+        end
+        return
+    end
+    for_each_reticle_behavior_in_scene(apply_type10_visibility)
+end
+
+--[[ # log (commented out)
+pcall(function()
+    local td = sdk.find_type_definition("chainsaw.ReticleGuiBehavior")
+    if td then
+        local methods = td:get_methods()
+        local method_names = {}
+        for _, m in ipairs(methods) do
+            table.insert(method_names, m:get_name())
+        end
+        _dbg_log("H12e", "method_enum", "ReticleGuiBehavior_methods", {
+            count=tostring(#method_names),
+            names=table.concat(method_names, "|")
+        })
+        local fields = td:get_fields()
+        local field_names = {}
+        for _, f in ipairs(fields) do
+            table.insert(field_names, f:get_name())
+        end
+        _dbg_log("H13_fields", "field_enum", "ReticleGuiBehavior_fields", {
+            count=tostring(#field_names),
+            names=table.concat(field_names, "|")
+        })
+    end
+    -- Also enumerate the OpenParam type if it exists
+    local opd = sdk.find_type_definition("chainsaw.ReticleGuiBehavior.OpenParam")
+    if opd then
+        local op_fields = opd:get_fields()
+        local op_field_names = {}
+        for _, f in ipairs(op_fields) do
+            table.insert(op_field_names, f:get_name())
+        end
+        local op_methods = opd:get_methods()
+        local op_method_names = {}
+        for _, m in ipairs(op_methods) do
+            table.insert(op_method_names, m:get_name())
+        end
+        _dbg_log("H13_openparam", "type_enum", "OpenParam_info", {
+            field_count=tostring(#op_field_names),
+            fields=table.concat(op_field_names, "|"),
+            method_count=tostring(#op_method_names),
+            methods=table.concat(op_method_names, "|")
+        })
+    else
+        _dbg_log("H13_openparam", "type_enum", "OpenParam_not_found", {})
+    end
+end)
+--]] -- #endregion
+
+-- Hook lateUpdate post-hook to override panel visibility after the game sets it
+local _hook_ok, _hook_err = pcall(function()
+    local td = sdk.find_type_definition("chainsaw.ReticleGuiBehavior")
+    --[[ # log (commented out)
+    _dbg_log("H7", "hook_setup", "td_check", {td_found=tostring(td ~= nil)})
+    --]] -- #endregion
+    if not td then return end
+    local late_update_method = td:get_method("lateUpdate")
+    --[[ # log (commented out)
+    _dbg_log("H7", "hook_setup", "method_check", {method_found=tostring(late_update_method ~= nil)})
+    --]] -- #endregion
+    if not late_update_method then return end
+    sdk.hook(
+        late_update_method,
+        nil,
+        function(retval)
+            --[[ # log (commented out)
+            _dbg_log("H7", "lateUpdate_posthook", "fired", {weapon_id=tostring(current_weapon_id)})
+            --]] -- #endregion
+            pcall(apply_reticle_panel_override)
+            return retval
+        end
+    )
+    --[[ # log (commented out)
+    _dbg_log("H7", "hook_setup", "hook_installed", {success="true"})
+    --]] -- #endregion
+end)
+--[[ # log (commented out)
+_dbg_log("H7", "hook_setup", "pcall_result", {ok=tostring(_hook_ok), err=tostring(_hook_err)})
+--]] -- #endregion
+
+-- Also run after all behaviors have updated, catches cases where lateUpdate
+-- hasn't fired yet (e.g. first load before aiming).
+re.on_pre_application_entry("LateUpdateBehavior", function()
+    pcall(apply_reticle_panel_override)
+end)
+
 local function write_vec4(obj, vec, offset)
 obj:write_float(offset, vec.x)
 obj:write_float(offset + 4, vec.y)
@@ -2132,7 +2546,54 @@ re.on_pre_gui_draw_element(function(element, context)
   -- Get game object and name once, reuse throughout function
   local game_object = element:call("get_GameObject")
   local name = game_object and game_object:call("get_Name")
+
+  --[[ Capture all GUI elements for 6304 debug panel (commented out)
+  if current_weapon_id == 6304 and game_object and name then
+    if not _G._dbg_6304_captured_gos then _G._dbg_6304_captured_gos = {} end
+    local dominated = _G._dbg_6304_captured_addrs or {}
+    local addr = tostring(game_object)
+    if not dominated[addr] then
+      dominated[addr] = true
+      _G._dbg_6304_captured_addrs = dominated
+      table.insert(_G._dbg_6304_captured_gos, {go=game_object, name=name})
+    end
+  elseif current_weapon_id ~= 6304 then
+    _G._dbg_6304_captured_gos = nil
+    _G._dbg_6304_captured_addrs = nil
+  end
+  --]]
   
+  --[[ # log (commented out)
+  if reticle_names[name] then
+    _dbg_log("H9", "on_pre_gui_draw_element", "reticle_seen", {
+        go_name=tostring(name), weapon_id=tostring(current_weapon_id),
+        is_aim=tostring(_G.is_aim), is_active=tostring(_G.is_active)
+    })
+  end
+  --]] -- #endregion
+
+  -- Apply panel visibility override early, before aim checks, so it takes effect
+  -- the very first time the game draws a reticle element (even before aiming).
+  if reticle_names[name] and not reticle_needs_restore and enable_laser_trail then
+    local wp_str = current_weapon_id and tostring(current_weapon_id) or "unknown"
+    local laser_on_early = weapon_laser_enabled[wp_str] ~= false
+    if laser_on_early then
+      local is_knife_early = current_weapon_id and ((current_weapon_id >= 5000 and current_weapon_id < 6000) or current_weapon_id == 6107)
+      local is_blast_crossbow_early = current_weapon_id == 6102
+      if not is_knife_early and not is_blast_crossbow_early then
+        --[[ # log (commented out)
+        _dbg_log("H6_gui_draw", "on_pre_gui_draw_element", "early_override", {
+            weapon_id=tostring(current_weapon_id), go_name=tostring(name)
+        })
+        --]] -- #endregion
+        pcall(function()
+          local b = game_object:call("getComponent(System.Type)", T_RETICLE_GUI_BEHAVIOR)
+          if b then apply_type10_visibility(b) end
+        end)
+      end
+    end
+  end
+
   -- Skip drawing dot for several frames after mode switch to prevent stale position flash
   if skip_trail_frames > 0 then
     if reticle_names[name] then
@@ -2201,11 +2662,14 @@ if game_object == nil then return true end
 local name = game_object:call("get_Name")
 
 if reticle_names[name] then
-  local reticle_behavior = game_object:call("getComponent(System.Type)", sdk.typeof("chainsaw.ReticleGuiBehavior"))
+  local reticle_behavior = game_object:call("getComponent(System.Type)", T_RETICLE_GUI_BEHAVIOR)
   if reticle_behavior then
     local color_panel = reticle_behavior:get_field("ColorPanel")
     if color_panel then
-      color_panel:call("set_Saturation", crosshair_saturation)
+      local laser_effectively_off_sat = not laser_enabled_for_weapon or not enable_laser_trail
+      local sat = (show_default_crosshair_laser_off and laser_effectively_off_sat and not is_non_muzzle_weapon)
+                  and default_crosshair_saturation or crosshair_saturation
+      color_panel:call("set_Saturation", sat)
       
       -- Set the scale using the GUI value - use different scales for knife vs regular weapons
       local current_scale = is_non_muzzle_weapon and knife_dot_scale or dot_scale
@@ -2215,7 +2679,19 @@ if reticle_names[name] then
   end
   
   local type_panel = reticle_behavior:get_field("TypePanel")
-  if type_panel then
+  local laser_effectively_off = not laser_enabled_for_weapon or not enable_laser_trail
+  local skip_type_panel_override = show_default_crosshair_laser_off and laser_effectively_off and not is_non_muzzle_weapon
+  if type_panel and skip_type_panel_override then
+    local current_color = type_panel:call("get_ColorScale")
+    if current_color then
+      local src = default_crosshair_match_laser and laser_dot_color_array or default_crosshair_color_array
+      current_color.x = src[1] or 1.0
+      current_color.y = src[2] or 1.0
+      current_color.z = src[3] or 1.0
+      current_color.w = src[4] or 1.0
+      type_panel:call("set_ColorScale", current_color)
+    end
+  elseif type_panel then
     -- Use different scales for knife vs regular weapons
     local current_scale = is_non_muzzle_weapon and knife_dot_scale or dot_scale
     local scale_vec = Vector3f.new(current_scale, current_scale, current_scale)
@@ -2238,11 +2714,15 @@ if reticle_names[name] then
           current_color.z = static_reticle_color_array[3] or 1.0
           current_color.w = 1.0  -- Always fully visible
         elseif not laser_enabled_for_weapon then
-          -- Weapon has laser disabled in settings: show static colored dot with separate color
-          current_color.x = static_reticle_color_array[1] or 1.0
-          current_color.y = static_reticle_color_array[2] or 1.0
-          current_color.z = static_reticle_color_array[3] or 1.0
-          current_color.w = 1.0  -- Fully visible
+          if show_default_crosshair_laser_off then
+            -- Let the game render its default crosshair without color override
+          else
+            -- Weapon has laser disabled in settings: show static colored dot with separate color
+            current_color.x = static_reticle_color_array[1] or 1.0
+            current_color.y = static_reticle_color_array[2] or 1.0
+            current_color.z = static_reticle_color_array[3] or 1.0
+            current_color.w = 1.0  -- Fully visible
+          end
         elseif not show_laser_dot then
           -- Laser is toggled OFF via hotkey
           -- Weapon 4005 always uses simple static mode internally
@@ -2304,50 +2784,59 @@ if reticle_names[name] then
     return true
   end
   
+  local laser_currently_active = laser_enabled_for_weapon and enable_laser_trail and not is_non_muzzle_weapon
+  if laser_currently_active then
+    view:call("set_Overlay", false)
+  elseif show_default_crosshair_laser_off and laser_effectively_off and not is_non_muzzle_weapon then
+    view:call("set_ViewType", default_crosshair_view_type)
+    view:call("set_Overlay", default_crosshair_overlay)
+    view:call("set_Detonemap", default_crosshair_detonemap)
+    view:call("set_DepthTest", default_crosshair_depth_test)
+  end
+  
   -- Handle positioning: prioritize simple static mode when laser is off, then static center vs dynamic
   -- Weapon 4005 always uses simple static mode regardless of checkbox state
   local effective_simple_static = simple_static_mode or (current_weapon_id == 4005)
   if (effective_simple_static and not show_laser_dot) or not laser_enabled_for_weapon or (current_weapon_id == 4005) then
-    -- Simple static mode with laser OFF or weapon laser disabled or weapon 4005: use basic game positioning for static dot
-    view:call("set_ViewType", 0) -- Use game's default view type
-    view:call("set_Overlay", true) -- Use game's default overlay
-    view:call("set_Detonemap", true)
-    view:call("set_DepthTest", true)
+    view:call("set_ViewType", default_crosshair_view_type)
+    view:call("set_Overlay", default_crosshair_overlay)
+    view:call("set_Detonemap", default_crosshair_detonemap)
+    view:call("set_DepthTest", default_crosshair_depth_test)
   elseif is_non_muzzle_weapon and not hide_dot_when_no_muzzle then
-    -- No muzzle weapon with hide option OFF: use basic game positioning for default dot appearance
-    view:call("set_ViewType", 0) -- Use game's default view type  
-    view:call("set_Overlay", true) -- Use game's default overlay
+    view:call("set_ViewType", 0)
+    view:call("set_Overlay", true)
     view:call("set_Detonemap", true)
     view:call("set_DepthTest", true)
   elseif static_center_dot and _G.is_aim and (_G.is_active) then
     -- Static center positioning (RE4 Remake Style)
-    -- Use pre-computed cached intersection from update_static_dot_interpolation()
+    local crosshair_active = show_default_crosshair_laser_off and laser_effectively_off and not is_non_muzzle_weapon
     if cached_static_intersection_point and re4.crosshair_dir then
-      view:call("set_ViewType", 1) -- world space
-      if is_non_muzzle_weapon then
+      view:call("set_ViewType", crosshair_active and default_crosshair_view_type or 1)
+      if crosshair_active then
+        view:call("set_Overlay", default_crosshair_overlay)
+        view:call("set_Detonemap", default_crosshair_detonemap)
+        view:call("set_DepthTest", default_crosshair_depth_test)
+      elseif is_non_muzzle_weapon then
         view:call("set_Overlay", true)
+        view:call("set_Detonemap", true)
+        view:call("set_DepthTest", false)
       else
         view:call("set_Overlay", false)
+        view:call("set_Detonemap", true)
+        view:call("set_DepthTest", false)
       end
-      view:call("set_Detonemap", true)
-      view:call("set_DepthTest", false)
         
-        -- Use proven distance-based scaling from working crosshair system
         local new_mat = re4.crosshair_dir:to_quat():to_mat4()
 
-        -- Clamp the distance for scaling to avoid flicker/oversize at close range
-
         local base_multiplier = 0.075
-        local min_distance_from_camera = 1.5 -- must match static dot logic
+        local min_distance_from_camera = 1.5
         local actual_distance = re4.crosshair_distance
         if static_center_dot and cached_static_intersection_point and cached_static_camera_pos then
-          -- Use the distance from cached camera to static dot, clamped to min
           local camera_to_dot = cached_static_intersection_point - cached_static_camera_pos
           actual_distance = math.max(camera_to_dot:length(), min_distance_from_camera)
         end
         local distance = actual_distance * base_multiplier
 
-        -- Use same clamping as dynamic dot
         if distance < min_scale then
           distance = min_scale
         elseif distance > max_scale then  
@@ -2362,17 +2851,23 @@ if reticle_names[name] then
         write_vec4(transform, crosshair_pos, 0xB0)
     end
   else
-    -- Dynamic positioning (original behavior, when not aiming in static mode and not using simple static backup)
+    -- Dynamic positioning
+    local crosshair_active_dyn = show_default_crosshair_laser_off and laser_effectively_off and not is_non_muzzle_weapon
     if global_intersection_point then
-      -- Normal dynamic positioning with custom calculations
-      view:call("set_ViewType", 1) -- world space
-      if is_non_muzzle_weapon then
+      view:call("set_ViewType", crosshair_active_dyn and default_crosshair_view_type or 1)
+      if crosshair_active_dyn then
+        view:call("set_Overlay", default_crosshair_overlay)
+        view:call("set_Detonemap", default_crosshair_detonemap)
+        view:call("set_DepthTest", default_crosshair_depth_test)
+      elseif is_non_muzzle_weapon then
         view:call("set_Overlay", true)
+        view:call("set_Detonemap", true)
+        view:call("set_DepthTest", true)
       else
         view:call("set_Overlay", false)
+        view:call("set_Detonemap", true)
+        view:call("set_DepthTest", true)
       end
-      view:call("set_Detonemap", true)
-      view:call("set_DepthTest", true)
         
       local new_mat = re4.crosshair_dir:to_quat():to_mat4()
 
@@ -2392,6 +2887,7 @@ if reticle_names[name] then
       write_vec4(transform, crosshair_pos, 0xB0)
     end
   end
+
 end
 return true
 end)
@@ -2821,13 +3317,16 @@ re.on_pre_application_entry("LockScene", function()
   end
 
   update_laser_trail() -- Keep trail and muzzle data in sync
+
+  -- Enforce reticle panel visibility every frame for consistency
+  pcall(apply_reticle_panel_override)
 end)
 
 re.on_draw_ui(function()
   if imgui.tree_node("Classic RE4 Laser Settings") then
     imgui.begin_rect()
     -- Laser Style Selection
-    imgui.text_colored(" Laser Behavior:", 0xFFFFFFAA)
+    imgui.text_colored(" Status:", 0xFFFFFFAA)
     imgui.same_line()
     -- Check if current weapon has laser disabled (takes priority over style)
     -- Compute directly here to ensure real-time accuracy
@@ -2836,13 +3335,13 @@ re.on_draw_ui(function()
     if laser_disabled_for_current_weapon then
         imgui.text_colored("Laser Disabled (Camera Spawn)", 0xFFFF6600)
     elseif static_center_dot then
-        imgui.text_colored("RE4 Remake Style", 0xAA0000FF)
+        imgui.text_colored("Laser/Projectile Follows Camera", 0xAA0000FF)
     else
-        imgui.text_colored("Classic RE4 Style", 0xAA0000FF)
+        imgui.text_colored("Laser/Projectile Follows Muzzle", 0xAA0000FF)
     end
     if simple_static_mode then
       imgui.same_line()
-      imgui.text_colored("+ Dot Crosshair", 0xAA00FF00)
+      imgui.text_colored("+ Crosshair", 0xAA00FF00)
     end
     if disable_shoulder_corrector then
       imgui.same_line()
@@ -2852,14 +3351,27 @@ re.on_draw_ui(function()
       imgui.same_line()
       imgui.text_colored("+ Hide Knife Dot", 0xFFFF00FF)
     end
+    if show_default_crosshair_laser_off then
+      imgui.same_line()
+      imgui.text_colored("+ Crosshair", 0xFF00CCFF)
+    end
+    if _G.classic_re4_laser_perfect_accuracy_enabled ~= false then
+      imgui.same_line()
+      imgui.text_colored("+ Perfect Accuracy", 0xFF66EEDD)
+    end
+    if _G.classic_re4_laser_point_range_enabled ~= false then
+      imgui.same_line()
+      imgui.text_colored("+ Perfect Focus", 0xFFEECC66)
+    end
     
     imgui.spacing()
     
-    if not static_center_dot then
-        imgui.push_style_color(2, 0.2, 0.8, 0.2, 1.0) -- Green background for active
+    local muzzle_mode = not static_center_dot
+    if muzzle_mode then
+        imgui.push_style_color(2, 0.2, 0.8, 0.2, 1.0) -- Green tint for active
     end
-    local classic_pressed = imgui.button("Classic RE4 Style", 200, 0)
-    if not static_center_dot then
+    local muzzle_changed, muzzle_new = imgui.checkbox("Classic RE4 Style##laser_behavior", muzzle_mode)
+    if muzzle_mode then
         imgui.pop_style_color(1)
     end
     if imgui.is_item_hovered() then
@@ -2867,31 +3379,40 @@ re.on_draw_ui(function()
     end
     
     imgui.same_line()
-    if static_center_dot then
-        imgui.push_style_color(2, 0.2, 0.8, 0.2, 1.0) -- Green background for active
+    local camera_mode = static_center_dot
+    if camera_mode then
+        imgui.push_style_color(2, 0.2, 0.8, 0.2, 1.0) -- Green tint for active
     end
-    local remake_pressed = imgui.button("RE4 Remake Style", 200, 0)
-    if static_center_dot then
+    local camera_changed, camera_new = imgui.checkbox("RE4 Remake Style##laser_behavior", camera_mode)
+    if camera_mode then
         imgui.pop_style_color(1)
     end
     if imgui.is_item_hovered() then
         imgui.set_tooltip("Laser always centered on screen")
     end
     
-    -- Handle button presses
-    if classic_pressed and static_center_dot then
-        static_center_dot = false
-      update_spawn_flag()
+    if muzzle_changed then
+        if muzzle_new then
+            static_center_dot = false
+        else
+            static_center_dot = true
+            dot_scale = 1.0
+        end
+        update_spawn_flag()
         save_config()
         hasRunInitially = false
-        manage_hooks(true)  -- Force check hooks when switching to dynamic mode
-    elseif remake_pressed and not static_center_dot then
-        static_center_dot = true
-      update_spawn_flag()
-        dot_scale = 0.85
+        manage_hooks(true)
+    elseif camera_changed then
+        if camera_new then
+            static_center_dot = true
+            dot_scale = 1.0
+        else
+            static_center_dot = false
+        end
+        update_spawn_flag()
         save_config()
         hasRunInitially = false
-        manage_hooks(true)  -- Force check hooks when switching to static mode
+        manage_hooks(true)
     end
     
     -- Quick Options
@@ -2901,9 +3422,10 @@ re.on_draw_ui(function()
     local weapon_id_str = current_weapon_id and tostring(current_weapon_id) or "unknown"
     local laser_disabled_for_current_weapon = weapon_laser_enabled[weapon_id_str] == false
     
+    --[[ Enable default crosshair (disabled)
     if not laser_disabled_for_current_weapon then
       local simple_static_changed = false
-      simple_static_changed, simple_static_mode = imgui.checkbox("Enable dot reticle", simple_static_mode)
+      simple_static_changed, simple_static_mode = imgui.checkbox("Enable default crosshair", simple_static_mode)
       if imgui.is_item_hovered() then
           imgui.set_tooltip("Enable completely static dot reticle when laser is off")
       end
@@ -2913,6 +3435,7 @@ re.on_draw_ui(function()
       
       imgui.same_line()
     end
+    --]]
     
     corrector_changed, disable_shoulder_corrector = imgui.checkbox("Disable Shoulder Corrector", disable_shoulder_corrector)
     if imgui.is_item_hovered() then
@@ -2954,7 +3477,81 @@ re.on_draw_ui(function()
         save_config()
     end
     
-    -- Capture Defaults section
+    local crosshair_off_changed = false
+    crosshair_off_changed, show_default_crosshair_laser_off = imgui.checkbox("Show crosshair when laser off", show_default_crosshair_laser_off)
+    if imgui.is_item_hovered() then
+        imgui.set_tooltip("When a weapon's laser is toggled off, the crosshair will show. *Laser behavior will temporarily show as Remake Style until laser is toggled back on.*")
+    end
+    if crosshair_off_changed then
+        reticle_needs_restore = true
+        save_config()
+    end
+    
+    imgui.spacing()
+    imgui.push_id("per_weapon_laser_section")
+    if imgui.button("Per-Weapon Laser Enable/Disable...") then
+      imgui.open_popup("per_weapon_laser_popup")
+    end
+    if imgui.is_item_hovered() then
+      imgui.set_tooltip("Select which weapons show the laser trail")
+    end
+    if imgui.begin_popup("per_weapon_laser_popup") then
+      imgui.text_colored(" Select weapons to show laser trail:", 0xFFFFFFAA)
+      imgui.text_colored(" (Unchecked = dot reticle only)", 0xFFAAAA00)
+      imgui.spacing()
+      if imgui.button("Enable All##pw") then
+        for _, category in ipairs(weapon_categories) do
+          for _, id in ipairs(category.ids) do
+            weapon_laser_enabled[tostring(id)] = true
+          end
+        end
+        save_config()
+        hasRunInitially = false
+        manage_hooks(true)
+      end
+      imgui.same_line()
+      if imgui.button("Disable All##pw") then
+        for _, category in ipairs(weapon_categories) do
+          for _, id in ipairs(category.ids) do
+            weapon_laser_enabled[tostring(id)] = false
+          end
+        end
+        save_config()
+        hasRunInitially = false
+        manage_hooks(true)
+        reticle_needs_restore = true
+      end
+      imgui.spacing()
+      local ordered_ids = {}
+      for _, category in ipairs(weapon_categories) do
+        for _, id in ipairs(category.ids) do
+          table.insert(ordered_ids, id)
+        end
+      end
+      for _, id in ipairs(ordered_ids) do
+        if id == 4005 then goto continue_weapon_loop3 end
+        local id_str = tostring(id)
+        local name = weapon_names[id] or ("Unknown (" .. id_str .. ")")
+        if weapon_laser_enabled[id_str] == nil then
+          weapon_laser_enabled[id_str] = true
+        end
+        local changed, new_val = imgui.checkbox(name .. "##wp" .. id_str, weapon_laser_enabled[id_str])
+        if changed then
+          weapon_laser_enabled[id_str] = new_val
+          save_config()
+          hasRunInitially = false
+          if id == current_weapon_id then
+            manage_hooks(true)
+            if not new_val then
+              reticle_needs_restore = true
+            end
+          end
+        end
+        ::continue_weapon_loop3::
+      end
+      imgui.end_popup()
+    end
+    imgui.pop_id()
     --[[
     imgui.spacing()
     imgui.text_colored("Capture Defaults (Mode: " .. current_game_mode .. "):", 0xFFAAAAFF)
@@ -3224,42 +3821,102 @@ re.on_draw_ui(function()
       save_config()
   end
   
-  -- Static reticle color (when weapon laser is disabled)
-  local static_reticle_color = {
-    static_reticle_color_array and static_reticle_color_array[1] or 1.0,
-    static_reticle_color_array and static_reticle_color_array[2] or 1.0,
-    static_reticle_color_array and static_reticle_color_array[3] or 1.0
-  }
-  local static_reticle_color_changed, new_static_reticle_color
-  local success_static = pcall(function()
-    static_reticle_color_changed, new_static_reticle_color = imgui.color_edit3("Static Reticle##static_reticle_picker", static_reticle_color, 4194304 | 32)
-  end)
-  if not success_static then
-    local static_reticle_color_array_4f = Vector4f.new(static_reticle_color_array[1], static_reticle_color_array[2], static_reticle_color_array[3], static_reticle_color_array[4] or 1.0)
-    static_reticle_color_changed, new_static_reticle_color = imgui.color_edit4("Static Reticle##static_reticle_picker", static_reticle_color_array_4f, 4194304 | 32)
-    if new_static_reticle_color then
-      static_reticle_color_array = {new_static_reticle_color.x, new_static_reticle_color.y, new_static_reticle_color.z, new_static_reticle_color.w}
-    end
-  else
-    if new_static_reticle_color then
-      static_reticle_color_array = new_static_reticle_color
-    end
-  end
+  imgui.end_rect(1)
   
-  if imgui.is_item_hovered() then
-      imgui.set_tooltip("Color of the static reticle when weapon does not have laser enabled")
-  end
+  if show_default_crosshair_laser_off then
+  imgui.same_line()
   
-  if static_reticle_color_changed then
+  -- Crosshair section (to the right of Color Presets)
+  imgui.begin_group()
+  imgui.begin_rect()
+  imgui.text_colored("Crosshair:", 0xFFFFFFAA)
+  local ml_changed, ml_new = imgui.checkbox("Match laser color##match_laser_crosshair", default_crosshair_match_laser)
+  if ml_changed then
+      default_crosshair_match_laser = ml_new
       save_config()
   end
+  if imgui.is_item_hovered() then
+      imgui.set_tooltip("Use the laser dot color for the crosshair when laser is off")
+  end
+  if not default_crosshair_match_laser then
+    local dc_color = {
+      default_crosshair_color_array[1] or 1.0,
+      default_crosshair_color_array[2] or 1.0,
+      default_crosshair_color_array[3] or 1.0
+    }
+    local dc_changed, dc_new
+    local dc_ok = pcall(function()
+      dc_changed, dc_new = imgui.color_edit3("Crosshair Color##default_crosshair_picker", dc_color, 4194304 | 32)
+    end)
+    if not dc_ok then
+      local dc_4f = Vector4f.new(default_crosshair_color_array[1], default_crosshair_color_array[2], default_crosshair_color_array[3], default_crosshair_color_array[4] or 1.0)
+      dc_changed, dc_new = imgui.color_edit4("Crosshair Color##default_crosshair_picker", dc_4f, 4194304 | 32)
+      if dc_new then
+        default_crosshair_color_array = {dc_new.x, dc_new.y, dc_new.z, dc_new.w}
+      end
+    else
+      if dc_new then
+        default_crosshair_color_array = dc_new
+      end
+    end
+    if imgui.is_item_hovered() then
+        imgui.set_tooltip("Color of the crosshair when laser is toggled off")
+    end
+    if dc_changed then
+        save_config()
+    end
+  end
+  imgui.set_next_item_width(110)
+  local dcvt_changed, dcvt_new = imgui.combo("##crosshair_viewtype", default_crosshair_view_type, CROSSHAIR_TYPE_COMBO_LABELS)
+  if dcvt_changed then
+      default_crosshair_view_type = dcvt_new
+      save_config()
+  end
+  if imgui.is_item_hovered() then
+    imgui.set_tooltip(
+      "Crosshair Type\n3D Crosshair: CANNOT BE USED WITH ANY WEAPON THAT HAS LASER TRAIL DISABLED IN Per-Weapon Laser Enable/Disable. Reticle tracks the muzzle in world space.\nDefault: native flat crosshair (center screen, *Bullet still spawn from muzzle if using with Iron Sights)."
+    )
+  end
+  imgui.same_line()
+  local dco_changed, dco_new = imgui.checkbox("Overlay##crosshair_overlay", default_crosshair_overlay)
+  if dco_changed then
+      default_crosshair_overlay = dco_new
+      save_config()
+  end
+  imgui.same_line()
+  local dcd_changed, dcd_new = imgui.checkbox("Detonemap##crosshair_detonemap", default_crosshair_detonemap)
+  if dcd_changed then
+      default_crosshair_detonemap = dcd_new
+      save_config()
+  end
+  imgui.same_line()
+  local dcdt_changed, dcdt_new = imgui.checkbox("Depth Test##crosshair_depthtest", default_crosshair_depth_test)
+  if dcdt_changed then
+      default_crosshair_depth_test = dcdt_new
+      save_config()
+  end
+  if imgui.is_item_hovered() then
+      imgui.set_tooltip("Always show in front")
+  end
+  imgui.set_next_item_width(200)
+  local dcs_changed, dcs_new = imgui.slider_float("Glow##crosshair_sat", default_crosshair_saturation, 0.0, 100.0, "%.1f")
+  if dcs_changed then
+      default_crosshair_saturation = dcs_new
+      default_crosshair_overlay = false
+      save_config()
+  end
+  if imgui.is_item_hovered() then
+      imgui.set_tooltip("Glow/saturation of the crosshair when laser is off")
+  end
   imgui.end_rect(1)
+  imgui.end_group()
+  end
   
   imgui.spacing()
   
   -- Laser/Knife Dot Settings
   imgui.begin_rect()
-  imgui.text_colored(" Laser/Knife Dot Settings:", 0xFFFFFFAA)
+  imgui.text_colored(" Laser/Knife Dot/Crosshhair Settings:", 0xFFFFFFAA)
   max_changed, max_scale = imgui.slider_float("Max Scale", max_scale, 0.4, 2.0, "%.2f")
   if imgui.is_item_hovered() then
       imgui.set_tooltip("Maximum size of the laser dot at far distances (Set this equal to min scale for realistic scaling)")
@@ -3276,7 +3933,7 @@ re.on_draw_ui(function()
       save_config()
   end
   
-  scale_changed, dot_scale = imgui.slider_float("Dot Scale", dot_scale, 0.1, 10.0, "%.2f")
+  scale_changed, dot_scale = imgui.slider_float("Dot/Crosshair Scale", dot_scale, 0.1, 10.0, "%.2f")
   if imgui.is_item_hovered() then
       imgui.set_tooltip("Overall scale multiplier for the laser dot size")
   end
@@ -3292,6 +3949,7 @@ re.on_draw_ui(function()
   if knife_scale_changed then
       save_config()
   end
+  
   
   saturation_changed, crosshair_saturation = imgui.slider_float("Glow", crosshair_saturation, 0.0, 100.0, "%.1f")
   if imgui.is_item_hovered() then
@@ -3490,7 +4148,7 @@ re.on_draw_ui(function()
   if imgui.button("Reset dot to default") then
       max_scale = 1.25
       min_scale = 0.3
-      dot_scale = 0.85
+      dot_scale = 1.0
       knife_dot_scale = 1.0
       crosshair_saturation = 20.0
       static_center_dot = false
@@ -3498,6 +4156,14 @@ re.on_draw_ui(function()
       simple_static_mode = false
       disable_shoulder_corrector = false
       hide_dot_when_no_muzzle = false
+      show_default_crosshair_laser_off = true
+      default_crosshair_color_array = {1.0, 1.0, 1.0, 1.0}
+      default_crosshair_match_laser = false
+      default_crosshair_saturation =1.0
+      default_crosshair_view_type = 1
+      default_crosshair_overlay = true
+      default_crosshair_detonemap = true
+      default_crosshair_depth_test = false
       laser_dot_color_array = {1.0, 0.0, 0.0, 1.0}
       knife_dot_color_array = {1.0, 1.0, 1.0, 1.0}
       laser_color_array = laser_dot_color_array
@@ -3561,10 +4227,18 @@ re.on_draw_ui(function()
   if imgui.button("Reset ALL laser settings to defaults") then
       max_scale = 1.25
       min_scale = 0.3
-      dot_scale = 0.85
+      dot_scale = 1.0
       knife_dot_scale = 1.0
       disable_shoulder_corrector = false
       hide_dot_when_no_muzzle = false
+      show_default_crosshair_laser_off = true
+      default_crosshair_color_array = {1.0, 1.0, 1.0, 1.0}
+      default_crosshair_match_laser = false
+      default_crosshair_saturation =1.0
+      default_crosshair_view_type = 1
+      default_crosshair_overlay = true
+      default_crosshair_detonemap = true
+      default_crosshair_depth_test = false
       laser_beam_color_array = {1.0, 0.0, 0.0, 1.0}
       laser_dot_color_array = {1.0, 0.0, 0.0, 1.0}
       knife_dot_color_array = {1.0, 1.0, 1.0, 1.0}
@@ -3577,6 +4251,14 @@ re.on_draw_ui(function()
       enable_laser_trail = true
       laser_trail_scale = 1.5
       hide_dot_when_no_muzzle = false
+      show_default_crosshair_laser_off = true
+      default_crosshair_color_array = {1.0, 1.0, 1.0, 1.0}
+      default_crosshair_match_laser = false
+      default_crosshair_saturation =1.0
+      default_crosshair_view_type = 1
+      default_crosshair_overlay = true
+      default_crosshair_detonemap = true
+      default_crosshair_depth_test = false
       -- Reset laser origin offsets to defaults
       laser_origin_offsets = {}
       for weapon_id, offset in pairs(default_laser_origin_offsets) do
@@ -3616,76 +4298,6 @@ re.on_draw_ui(function()
       hasRunInitially = false
   end
   imgui.end_rect(1)
-  
-  imgui.spacing()
-  
-  -- Weapon Laser Enable Settings
-  if imgui.tree_node("Weapon Laser Settings") then
-    imgui.begin_rect()
-    imgui.text_colored(" Select weapons to show laser trail:", 0xFFFFFFAA)
-    imgui.text_colored(" (Unchecked weapons will only show dot reticle)", 0xFFAAAA00)
-    imgui.spacing()
-    
-    -- Enable All / Disable All buttons
-    if imgui.button("Enable All") then
-      for _, category in ipairs(weapon_categories) do
-        for _, id in ipairs(category.ids) do
-          weapon_laser_enabled[tostring(id)] = true
-        end
-      end
-      save_config()
-      hasRunInitially = false  -- Force re-run of processWeaponData to update _GenerateFollowTarget
-      manage_hooks(true)
-    end
-    imgui.same_line()
-    if imgui.button("Disable All") then
-      for _, category in ipairs(weapon_categories) do
-        for _, id in ipairs(category.ids) do
-          weapon_laser_enabled[tostring(id)] = false
-        end
-      end
-      save_config()
-      hasRunInitially = false  -- Force re-run of processWeaponData to update _GenerateFollowTarget
-      manage_hooks(true)
-    end
-    
-    imgui.spacing()
-    
-    -- Flat list of weapons (no categories) showing names only
-    local ordered_ids = {}
-    for _, category in ipairs(weapon_categories) do
-      for _, id in ipairs(category.ids) do
-        table.insert(ordered_ids, id)
-      end
-    end
-
-    for _, id in ipairs(ordered_ids) do
-      -- Skip weapon 4005 (Minecart Handgun) - it uses forced static mode only
-      if id == 4005 then
-        goto continue_weapon_loop
-      end
-      local id_str = tostring(id)
-      local name = weapon_names[id] or ("Unknown (" .. id_str .. ")")
-      -- Default to true if not set
-      if weapon_laser_enabled[id_str] == nil then
-        weapon_laser_enabled[id_str] = true
-      end
-      local changed, new_val = imgui.checkbox(name .. "##wp" .. id_str, weapon_laser_enabled[id_str])
-      if changed then
-        weapon_laser_enabled[id_str] = new_val
-        save_config()
-        hasRunInitially = false  -- Force re-run of processWeaponData to update _GenerateFollowTarget
-        if id == current_weapon_id then
-          -- If we toggled the weapon we're holding, immediately adjust hook/spawn mode
-          manage_hooks(true)
-        end
-      end
-      ::continue_weapon_loop::
-    end
-    
-    imgui.end_rect(1)
-    imgui.tree_pop()
-  end
   
   imgui.spacing()
   
@@ -3729,6 +4341,82 @@ re.on_draw_ui(function()
     
     imgui.tree_pop()
   end
+  --[[ Debug: 6304 Panel Visibility Tester (commented out)
+  if current_weapon_id == 6304 then
+    imgui.spacing()
+    if imgui.tree_node("[DEBUG] 6304 Panel Inspector") then
+      imgui.begin_rect()
+      imgui.text_colored("Live panel visibility for Compound Bow (6304):", 0xFFFFFFAA)
+      imgui.text_colored("Captures ALL gui elements from draw callback.", 0xFF88FFFF)
+      local captured = _G._dbg_6304_captured_gos or {}
+      imgui.text("Captured GUI objects: " .. tostring(#captured))
+      for ci, entry in ipairs(captured) do
+        pcall(function()
+          local go = entry.go
+          local go_name = entry.name or "?"
+          local go_addr = tostring(go)
+          imgui.spacing()
+          imgui.text_colored(" [" .. ci .. "] " .. go_name .. " (" .. go_addr .. "):", 0xFF00FFAA)
+          local beh = go:call("getComponent(System.Type)", T_RETICLE_GUI_BEHAVIOR)
+          if beh then
+            imgui.same_line()
+            imgui.text_colored("has ReticleGuiBehavior", 0xFF00FF00)
+            local all_panels = {"TYPE00Panel","TYPE01Panel","TYPE02Panel","TYPE04Panel","TYPE05Panel","TYPE06Panel","TYPE07Panel","TYPE08Panel","TYPE09Panel","TYPE10Panel","TYPE90Panel","CurrWeaponPanel","ColorPanel","TypePanel"}
+            for _, pname in ipairs(all_panels) do
+              local ok, panel = pcall(function() return beh:get_field(pname) end)
+              if ok and panel then
+                local ok2, vis = pcall(function() return panel:call("get_Visible") end)
+                if ok2 then
+                  local changed, new_vis = imgui.checkbox(pname .. "##" .. go_addr, vis)
+                  if changed then
+                    pcall(function() panel:call("set_Visible", new_vis) end)
+                  end
+                  imgui.same_line()
+                  imgui.text_colored(tostring(panel), 0xFF888888)
+                else
+                  imgui.text(pname .. ": (get_Visible failed)")
+                end
+              else
+                imgui.text_colored(pname .. ": nil", 0xFF666666)
+              end
+            end
+          else
+            imgui.same_line()
+            imgui.text_colored("no ReticleGuiBehavior", 0xFFFF4444)
+            local gui = nil
+            pcall(function() gui = go:call("getComponent(System.Type)", sdk.typeof("via.gui.GUI")) end)
+            if gui then
+              local view = nil
+              pcall(function() view = gui:call("get_View") end)
+              if view then
+                local overlay = nil
+                local viewType = nil
+                pcall(function() overlay = view:call("get_Overlay") end)
+                pcall(function() viewType = view:call("get_ViewType") end)
+                imgui.text("  Overlay=" .. tostring(overlay) .. " ViewType=" .. tostring(viewType))
+                local ov_changed, ov_new = imgui.checkbox("Overlay##" .. go_addr, overlay == true)
+                if ov_changed then pcall(function() view:call("set_Overlay", ov_new) end) end
+              end
+            end
+            local tr = nil
+            pcall(function() tr = go:call("get_Transform") end)
+            if tr then
+              local childCount = 0
+              pcall(function() childCount = tr:call("get_ChildCount") end)
+              imgui.text("  Children: " .. tostring(childCount))
+            end
+          end
+        end)
+      end
+      if imgui.button("Clear Captured") then
+        _G._dbg_6304_captured_gos = {}
+      end
+      imgui.end_rect(1)
+      imgui.tree_pop()
+    end
+  end
+  --]]
+
   imgui.end_rect(1)
   imgui.tree_pop()
   end
