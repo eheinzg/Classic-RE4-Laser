@@ -33,6 +33,7 @@ local wc = false
 
 local show_laser_dot = true -- Controls dot/crosshair visibility
 local show_per_weapon_popup = false -- Per-weapon laser popup window open state
+local post_shot_pw_popup_weapon_idx = 1 -- 1-based index into post-shot-by-weapon popup weapon combo (REFramework imgui.combo)
 local hide_dot_when_no_muzzle = false -- Hide reticle/dot when no muzzle is found
 local show_default_crosshair_laser_off = true -- Show game's default crosshair when laser is disabled for a weapon (default on)
 
@@ -359,6 +360,15 @@ end
 -- Track last weapon ID and accuracy state to avoid redundant processing
 local last_spread_weapon_id = nil
 local last_spread_accuracy_state = nil
+-- Cached for update_spread_state pass after update_laser_trail when PA-only-while-laser is on
+local spread_refresh_bt_gun = nil
+local spread_refresh_weapon_id = nil
+-- When true, Perfect Accuracy / Perfect Focus only apply while the classic muzzle laser trail is active (aim + trail rules).
+local perfect_accuracy_only_when_laser_active = false
+local perfect_focus_only_when_laser_active = false
+local classic_laser_trail_effective_prev = nil -- last classic_laser_active_for_perfect; PF reticle refresh + PA spread refresh on change
+-- Written each update_laser_trail(): true iff beam would draw or grace (same as should_show || within_grace_period)
+local classic_laser_active_for_perfect = false
 
 -- Apply or restore spread based on perfect accuracy setting
 local function update_spread_state(bt_gun, weapon_id)
@@ -371,7 +381,11 @@ local function update_spread_state(bt_gun, weapon_id)
     local ironsight_active = rawget(_G, "standalone_iron_sight_active") == true
     local ironsight_pa = ironsight_active and rawget(_G, "standalone_perfect_accuracy_enabled") == true
     local pa_flag = _G.classic_re4_laser_perfect_accuracy_enabled
-    local should_zero = ironsight_pa or (pa_flag ~= false)
+    local classic_pa = (pa_flag ~= false)
+    if perfect_accuracy_only_when_laser_active and not ironsight_pa then
+      classic_pa = classic_pa and classic_laser_active_for_perfect
+    end
+    local should_zero = ironsight_pa or classic_pa
     
     -- Check if weapon changed or cache is empty (need to rebuild)
     local weapon_changed = (weapon_id ~= last_spread_weapon_id)
@@ -402,7 +416,7 @@ local function update_spread_state(bt_gun, weapon_id)
     -- Update tracking after shell generator check
     last_spread_weapon_id = weapon_id
     last_spread_accuracy_state = should_zero
-    
+
     -- Apply zero spread if enabled and we have cached objects
     if should_zero and next(spread_cache) ~= nil then
         for spread_key, spread_entry in pairs(spread_cache) do
@@ -450,9 +464,34 @@ local character_ids = {
 "ch3a8z0_head", "ch6i0z0_head", "ch6i1z0_head", "ch6i2z0_head",
 "ch6i3z0_head", "ch3a8z0_MC_head", "ch6i5z0_head"
 }
-local disable_shoulder_corrector = false 
+local disable_shoulder_corrector = false
 
-local crosshair_saturation = 20.0  -- Crosshair color saturation (glow)
+-- Default laser dot glow (matches initial crosshair_saturation) and beam MDF params (wp4000_00_Laserbeam)
+local LASER_DOT_GLOW_DEFAULT = 20.0
+local LASER_BEAM_MATERIAL_DEFAULTS = {
+  AlphaRate = 0.009999999776482582,
+  EmissiveColor = {1.0, 0.0, 0.0, 1.0},
+  EmissiveIntensity = 100.0,
+  GradationRate = 1.2100000381469727,
+  SmokeContrast_Add = 0.0,
+  SmokeContrast_Pow = 5.0,
+  SmokeDetailScale = 7.679999828338623,
+  SmokeDetailSpeed = 4.769999980926514,
+}
+local function copy_laser_beam_material_defaults_into(out)
+  if not out then return end
+  local s = LASER_BEAM_MATERIAL_DEFAULTS
+  out.AlphaRate = s.AlphaRate
+  out.EmissiveColor = { s.EmissiveColor[1], s.EmissiveColor[2], s.EmissiveColor[3], s.EmissiveColor[4] }
+  out.EmissiveIntensity = s.EmissiveIntensity
+  out.GradationRate = s.GradationRate
+  out.SmokeContrast_Add = s.SmokeContrast_Add
+  out.SmokeContrast_Pow = s.SmokeContrast_Pow
+  out.SmokeDetailScale = s.SmokeDetailScale
+  out.SmokeDetailSpeed = s.SmokeDetailSpeed
+end
+
+local crosshair_saturation = LASER_DOT_GLOW_DEFAULT  -- Crosshair color saturation (glow)
 
 -- Weapon names for UI display
 local weapon_names = {
@@ -529,6 +568,15 @@ local laser_dot_color_array = {1.0, 0.0, 0.0, 1.0}   -- RGBA values for laser do
 local knife_dot_color_array = {1.0, 1.0, 1.0, 1.0}   -- RGBA values for knife/no-muzzle dot (0.0-1.0)
 local static_reticle_color_array = {1.0, 1.0, 1.0, 1.0}  -- RGBA values for static reticle when weapon laser disabled (0.0-1.0)
 local laser_color_array = laser_dot_color_array       -- Legacy compatibility
+-- Focused-aim colors (chainsaw.Gun._IsReticleFitting): one table to stay under Lua's 200 main-chunk locals limit
+local focused_laser_colors = {
+  enabled = false,
+  dot = {0.0, 1.0, 0.0, 1.0},
+  beam = {0.0, 1.0, 0.0, 1.0},
+  runtime_beam_sig = nil,
+  match_focused_dot_beam = false, -- When focused-aim colors active: beam follows dot
+  glow = LASER_DOT_GLOW_DEFAULT, -- ColorPanel saturation (dot glow) while focused (_IsReticleFitting)
+}
 
 local function sanitize_color_array(arr, fallback)
   local fb = fallback or {1.0, 1.0, 1.0, 1.0}
@@ -586,7 +634,7 @@ local default_laser_origin_offsets = {
     ["4200"] = {x = -0.029400000348687172, y = 0.012900000438094139, z = -0.04780000075697899},
     ["4201"] = {x = 0.0, y = -0.04780000075697899, z = -0.04780000075697899},
     ["4202"] = {x = 0.0, y = 0.02850000001490116, z = -0.04830000177025795},
-    ["4400"] = {x = -0.027000000298023224, y = 0.007200000072002888, z = -0.0638000023841858},
+    ["4400"] = {x = -0.027000000298023224, y = -0.0075, z = -0.0638000023841858},
     ["4401"] = {x = -0.030500000342726707, y = 0.016499999910593033, z = -0.16910000145435333},
     ["4402"] = {x = 0.0, y = -0.04479999840259552, z = -0.1324000060558319},
     ["4500"] = {x = 0.0, y = -0.028999999165534973, z = -0.09700000286102295},
@@ -608,7 +656,7 @@ local default_laser_origin_offsets = {
     ["6111"] = {x = 0.060499999672174454, y = -0.017999999225139618, z = -0.30140000581741333},
     ["6112"] = {x = 0.0, y = -0.04540000110864639, z = 0.0044999998062849045},
     ["6113"] = {x = 0.0, y = -0.023600000888109207, z = -0.14149999618530273},
-    ["6114"] = {x = -0.027000000298023224, y = 0.007200000072002888, z = -0.0638000023841858},
+    ["6114"] = {x = -0.027000000298023224, y = -0.0075, z = -0.0638000023841858},
     ["6300"] = {x = 0.0, y = -0.04740000143647194, z = -0.003700000001117587},
     ["6304"] = {x = -0.07500000298023224, y = 0.0010000000474974513, z = -0.05010000019073486}
 }
@@ -624,10 +672,329 @@ end
 
 -- Laser trail variables
 local enable_laser_trail = true  -- Enable/disable laser trail
+-- Post-shot hide / dim laser state (single table to stay under Lua's 200 locals-per-chunk limit)
+local post_shot = {
+  hide_laser = false,
+  timer_sec = 0.2,
+  effect_until = 0.0,
+  restrict_list = false,
+  weapon_ids = {},
+  firing_weapon_id = nil,
+  dim_enabled = false,
+  dim_restrict_list = false,
+  dim_weapon_ids = {},
+  dim_dot_scale = 0.95,
+  dim_glow_saturation = 1.0, -- ColorPanel glow while post-shot dim laser is active
+  dim_intensity_dim = 1.0, -- EmissiveIntensity during post-shot dim laser (matches material editor slider)
+  -- Snapshot of _G.laser_mat_params beam fields per material name (same keys the UI uses); nil = not captured yet
+  dim_mat_table_backup = nil,
+  firing_mode = nil, -- "hide"|"dim" while post-shot window is active (set from hook)
+  per_weapon = {}, -- [weaponIdStr] = { mode="global"|"off"|"hide"|"dim", timer_sec?, dim_dot_scale?, ... }
+  match_main_dot_beam = false, -- Custom Colors: beam uses same RGBA as dot (normal aim)
+  -- Handguns for hide-crosshair-after-shot only (hardcoded catalog IDs; names in comments)
+  crosshair_hide_pistol_ids = {
+    [4000] = true, -- SG-09 R
+    [4001] = true, -- Punisher
+    [4002] = true, -- Red9
+    [4003] = true, -- Blacktail
+    [4004] = true, -- Matilda
+    [4005] = true, -- Minecart Handgun
+    [4500] = true, -- Broken Butterfly
+    [4501] = true, -- Killer7
+    [4502] = true, -- Handcannon
+    [6000] = true, -- Sentinel Nine
+    [6103] = true, -- Blacktail AC
+    [6112] = true, -- Punisher MC
+    [6113] = true, -- Red9 SW
+    [6300] = true, -- XM96E1
+  },
+  -- Pistol crosshair hide-after-shot (nested in post_shot for Lua main-chunk local limit)
+  crosshair_after = { enabled = false, timer_sec = 0.25, effect_until = 0.0, weapon_id = nil },
+}
+
+-- Post-shot dim EmissiveIntensity UI + config use 0.05 steps (0–100)
+local function snap_post_shot_dim_emissive(v)
+  if type(v) ~= "number" then return v end
+  return math.max(0.0, math.min(100.0, math.floor(v / 0.05 + 0.5) * 0.05))
+end
+
 local laser_trail_scale = 1.5   -- Scale of the laser trail
 local laser_trail_gameobject = nil  -- Reference to the laser trail game object
 local laser_mesh_resource = sdk.create_resource("via.render.MeshResource", "_chainsaw/character/wp/wp40/wp4000/21/wp4000_22.mesh")  -- Laser mesh resource
 local laser_material_resource = sdk.create_resource("via.render.MeshMaterialResource", "LaserColors/classicRE4LaserMaterial.mdf2")  -- Laser material resource
+
+local apply_laser_trail_settings  -- forward declaration; body assigned after save/load_config
+
+-- Global hide / dim laser applies to every muzzle weapon; use Post-shot by weapon → Off to exclude one.
+function post_shot.hide_applies_to_weapon_id_str(_wid_str)
+  return true
+end
+
+function post_shot.dim_applies_to_weapon_id_str(_wid_str)
+  return true
+end
+
+function post_shot.resolved_mode_for_weapon_id_str(wid_str)
+  local row = post_shot.per_weapon and post_shot.per_weapon[wid_str]
+  local m = (row and row.mode) or "global"
+  if m == "off" then return "off" end
+  -- Explicit per-weapon hide / dim laser: the row targets this weapon id; do not gate on global hide/dim laser.
+  if m == "hide" then return "hide" end
+  if m == "dim" then return "dim" end
+  if post_shot.hide_laser and post_shot.hide_applies_to_weapon_id_str(wid_str) then return "hide" end
+  if post_shot.dim_enabled and post_shot.dim_applies_to_weapon_id_str(wid_str) then return "dim" end
+  return "off"
+end
+
+function post_shot.any_weapon_needs_hook()
+  if not post_shot.per_weapon then return false end
+  for wid_str, _ in pairs(post_shot.per_weapon) do
+    if post_shot.resolved_mode_for_weapon_id_str(wid_str) ~= "off" then return true end
+  end
+  return false
+end
+
+function post_shot.hook_should_run()
+  return post_shot.hide_laser or post_shot.dim_enabled or post_shot.any_weapon_needs_hook()
+end
+
+function post_shot.request_fire_hook_needed()
+  return post_shot.hook_should_run() or (post_shot.crosshair_after and post_shot.crosshair_after.enabled)
+end
+
+-- True when the aim laser dot/trail is considered "on" (pistol crosshair hide-after-shot must not apply).
+function post_shot.crosshair_reticle_hide_laser_is_on()
+  if is_non_muzzle_weapon then return false end
+  local wid = current_weapon_id or cached_weapon_id
+  if not wid then return false end
+  local wstr = tostring(wid)
+  if weapon_laser_enabled[wstr] == false then return false end
+  if not enable_laser_trail then return false end
+  if not show_laser_dot then return false end
+  return true
+end
+
+function post_shot.crosshair_hide_effectively_active()
+  local ch = post_shot.crosshair_after
+  if not ch or not ch.enabled then return false end
+  if crosshair_combo_shows_3d_crosshair() then return false end
+  if not ch.weapon_id or not post_shot.crosshair_hide_pistol_ids[ch.weapon_id] then return false end
+  if post_shot.crosshair_reticle_hide_laser_is_on() then return false end
+  if ch.effect_until <= 0.0 or os.clock() >= ch.effect_until then return false end
+  local wid = current_weapon_id or cached_weapon_id
+  if not wid or wid ~= ch.weapon_id then return false end
+  return true
+end
+
+-- REFramework imgui.combo uses 1-based indices here (same as "Select Weapon" in this file), not 0-based like crosshair_view_type.
+function post_shot.pw_mode_to_combo_idx(mode)
+  if mode == "off" then return 2 end
+  if mode == "hide" then return 3 end
+  if mode == "dim" then return 4 end
+  return 1
+end
+
+function post_shot.pw_combo_idx_to_mode(idx)
+  if idx == 2 then return "off" end
+  if idx == 3 then return "hide" end
+  if idx == 4 then return "dim" end
+  return "global"
+end
+
+function post_shot.effect_window_active()
+  if not enable_laser_trail then return false end
+  -- Do not use is_non_muzzle_weapon here: it can be stale for a frame after weapon swap before
+  -- update_muzzle_and_laser_data runs, which would block dim try_capture on the same frame as requestFire.
+  -- The post-shot hook already skips knives / non-muzzle via the same flag at fire time.
+  if not current_weapon_id then return false end
+  local wid = tostring(current_weapon_id)
+  if weapon_laser_enabled[wid] == false then return false end
+  if os.clock() >= post_shot.effect_until then return false end
+  if not post_shot.firing_weapon_id or current_weapon_id ~= post_shot.firing_weapon_id then return false end
+  if post_shot.firing_mode == "hide" then
+    local pw = post_shot.per_weapon and post_shot.per_weapon[wid]
+    if pw and pw.mode == "hide" then return true end
+    return post_shot.hide_applies_to_weapon_id_str(wid)
+  end
+  if post_shot.firing_mode == "dim" then
+    local pw = post_shot.per_weapon and post_shot.per_weapon[wid]
+    if pw and pw.mode == "dim" then return true end
+    return post_shot.dim_applies_to_weapon_id_str(wid)
+  end
+  return false
+end
+
+function post_shot.hide_effectively_active()
+  return post_shot.firing_mode == "hide" and post_shot.effect_window_active()
+end
+
+function post_shot.dim_effectively_active()
+  return post_shot.firing_mode == "dim" and post_shot.effect_window_active()
+end
+
+local function maybe_refresh_point_range_after_laser_gate_changed()
+  if not perfect_focus_only_when_laser_active and not perfect_accuracy_only_when_laser_active then
+    return
+  end
+  local e = classic_laser_active_for_perfect
+  if classic_laser_trail_effective_prev == nil then
+    classic_laser_trail_effective_prev = e
+    return
+  end
+  if e ~= classic_laser_trail_effective_prev then
+    classic_laser_trail_effective_prev = e
+    if perfect_focus_only_when_laser_active then
+      hasRunInitially = false
+    end
+    if perfect_accuracy_only_when_laser_active then
+      force_spread_update = true
+    end
+  end
+end
+
+function post_shot.effective_dim_intensity()
+  local wid = post_shot.firing_weapon_id and tostring(post_shot.firing_weapon_id) or nil
+  local row = wid and post_shot.per_weapon and post_shot.per_weapon[wid]
+  if row and row.dim_intensity_dim ~= nil then return row.dim_intensity_dim end
+  return post_shot.dim_intensity_dim or 0.0
+end
+
+function post_shot.effective_dim_dot_scale()
+  local wid = post_shot.firing_weapon_id and tostring(post_shot.firing_weapon_id) or nil
+  local row = wid and post_shot.per_weapon and post_shot.per_weapon[wid]
+  if row and row.dim_dot_scale ~= nil then return row.dim_dot_scale end
+  return post_shot.dim_dot_scale
+end
+
+function post_shot.effective_dim_glow_saturation()
+  local wid = post_shot.firing_weapon_id and tostring(post_shot.firing_weapon_id) or nil
+  local row = wid and post_shot.per_weapon and post_shot.per_weapon[wid]
+  local v = (row and row.dim_glow_saturation ~= nil) and row.dim_glow_saturation or (post_shot.dim_glow_saturation or 1.0)
+  return math.max(1.0, math.min(100.0, v))
+end
+
+function post_shot.restore_dim_material_from_saved()
+  if not post_shot.dim_mat_table_backup or not next(post_shot.dim_mat_table_backup) then
+    post_shot.dim_mat_table_backup = nil
+    return
+  end
+  _G.laser_mat_params = _G.laser_mat_params or {}
+  for matName, snap in pairs(post_shot.dim_mat_table_backup) do
+    if not _G.laser_mat_params[matName] then _G.laser_mat_params[matName] = {} end
+    if snap.EmissiveIntensity ~= nil then
+      _G.laser_mat_params[matName].EmissiveIntensity = snap.EmissiveIntensity
+    end
+  end
+  apply_laser_trail_settings()
+  -- Direct mesh write using captured indices (covers type-id mismatches apply_laser_trail_settings can miss)
+  local go = laser_trail_gameobject
+  if go and go.get_Valid and go:get_Valid() then
+    local mc = go:call("getComponent(System.Type)", sdk.typeof("via.render.Mesh"))
+    if mc and mc.setMaterialFloat then
+      for _, snap in pairs(post_shot.dim_mat_table_backup) do
+        if snap.jkI and snap.EmissiveIntensity ~= nil then
+          local jj, kk, v = snap.jkI[1], snap.jkI[2], snap.EmissiveIntensity
+          pcall(function() mc:setMaterialFloat(jj, kk, v) end)
+        end
+      end
+    end
+  end
+  post_shot.dim_mat_table_backup = nil
+end
+
+-- Same data path as the Laser Beam Material Editor sliders: _G.laser_mat_params + apply_laser_trail_settings()
+-- After setMesh/set_Material (trail recreate), (j,k) indices change; refresh from names, keep snapshot restore values.
+function post_shot.refresh_dim_jk_indices(mc)
+  if not post_shot.dim_mat_table_backup or not mc or not mc.get_MaterialNum or not mc.getMaterialVariableNum
+      or not mc.getMaterialVariableName then
+    return
+  end
+  for matName, snap in pairs(post_shot.dim_mat_table_backup) do
+    local matCount = mc:get_MaterialNum()
+    for j = 0, matCount - 1 do
+      if mc:getMaterialName(j) == matName then
+        local matParam = mc:getMaterialVariableNum(j)
+        for k = 0, matParam - 1 do
+          local paramName = mc:getMaterialVariableName(j, k)
+          if paramName == "EmissiveIntensity" and snap.EmissiveIntensity ~= nil then
+            snap.jkI = { j, k }
+          end
+        end
+        break
+      end
+    end
+  end
+end
+
+function post_shot.try_capture_and_dim_emissive()
+  if not post_shot.dim_effectively_active() then return end
+  local go = laser_trail_gameobject
+  if not go or not go.get_Valid or not go:get_Valid() then
+    return
+  end
+  local mc = go:call("getComponent(System.Type)", sdk.typeof("via.render.Mesh"))
+  if not mc or not mc.get_MaterialNum or not mc.getMaterialVariableNum or not mc.getMaterialVariableName then
+    return
+  end
+  _G.laser_mat_params = _G.laser_mat_params or {}
+
+  if post_shot.dim_mat_table_backup == nil then
+    local accum = {}
+    local matCount = mc:get_MaterialNum()
+    for j = 0, matCount - 1 do
+      local matName = mc:getMaterialName(j)
+      if matName then
+        if not _G.laser_mat_params[matName] then _G.laser_mat_params[matName] = {} end
+        local snap = {}
+        local matParam = mc:getMaterialVariableNum(j)
+        for k = 0, matParam - 1 do
+          local paramName = mc:getMaterialVariableName(j, k)
+          if paramName == "EmissiveIntensity" and (mc.getMaterialFloat or mc.call) then
+            local okf, cur = pcall(function() return mc:getMaterialFloat(j, k) end)
+            if (not okf or type(cur) ~= "number") and mc.call then
+              okf, cur = pcall(function() return mc:call("getMaterialFloat", j, k) end)
+            end
+            if okf and type(cur) == "number" then
+              if _G.laser_mat_params[matName].EmissiveIntensity == nil then
+                _G.laser_mat_params[matName].EmissiveIntensity = cur
+              end
+              snap.EmissiveIntensity = _G.laser_mat_params[matName].EmissiveIntensity
+              snap.jkI = { j, k }
+            end
+          end
+        end
+        if snap.EmissiveIntensity ~= nil then
+          accum[matName] = snap
+        end
+      end
+    end
+    if next(accum) then
+      post_shot.dim_mat_table_backup = accum
+    end
+  else
+    post_shot.refresh_dim_jk_indices(mc)
+  end
+
+  if post_shot.dim_mat_table_backup and next(post_shot.dim_mat_table_backup) then
+    local dim_i = post_shot.effective_dim_intensity()
+    for matName, snap in pairs(post_shot.dim_mat_table_backup) do
+      if not _G.laser_mat_params[matName] then _G.laser_mat_params[matName] = {} end
+      if snap.EmissiveIntensity ~= nil then
+        _G.laser_mat_params[matName].EmissiveIntensity = dim_i
+      end
+    end
+    apply_laser_trail_settings()
+    -- Direct mesh write (indices from capture; avoids material-name / type-id mismatches)
+    if mc.setMaterialFloat then
+      for _, snap in pairs(post_shot.dim_mat_table_backup) do
+        if snap.jkI then
+          local jj, kk = snap.jkI[1], snap.jkI[2]
+          pcall(function() mc:setMaterialFloat(jj, kk, dim_i) end)
+        end
+      end
+    end
+  end
+end
 
 -- Manual origin offset controls for different weapon laser modules
 local laser_origin_offset_x = 0.0  -- X-axis offset from muzzle position
@@ -713,6 +1080,63 @@ end
 
 local function on_post_request_fire(retval)
   return retval
+end
+
+local post_shot_hide_hooks_installed = false
+local function install_post_shot_laser_hide_hooks()
+  if post_shot_hide_hooks_installed then return end
+  if not post_shot.request_fire_hook_needed() then return end
+  -- Pre-requestFire: hide as soon as the game commits a shot (post runs after draw, ~1 frame late).
+  local function on_pre_request_fire_hide_laser(args)
+    local ps_laser = post_shot.hook_should_run()
+    local ch = post_shot.crosshair_after and post_shot.crosshair_after.enabled
+    if not ps_laser and not ch then return end
+    if ch and not crosshair_combo_shows_3d_crosshair() and not is_non_muzzle_weapon and not post_shot.crosshair_reticle_hide_laser_is_on() then
+      local wid = current_weapon_id or cached_weapon_id
+      if wid and post_shot.crosshair_hide_pistol_ids[wid] then
+        local c = post_shot.crosshair_after
+        c.weapon_id = wid
+        c.effect_until = os.clock() + math.max(0.01, math.min(10.0, tonumber(c.timer_sec) or 0.25))
+      end
+    end
+    if not ps_laser then return end
+    if not current_weapon_id or is_non_muzzle_weapon then return end
+    local wid = tostring(current_weapon_id)
+    if weapon_laser_enabled[wid] == false then return end
+    if not enable_laser_trail then return end
+    local resolved = post_shot.resolved_mode_for_weapon_id_str(wid)
+    if resolved == "off" then return end
+    post_shot.firing_mode = resolved
+    post_shot.firing_weapon_id = current_weapon_id
+    local pw = post_shot.per_weapon and post_shot.per_weapon[wid]
+    local t = post_shot.timer_sec
+    if pw and pw.timer_sec ~= nil then
+      t = tonumber(pw.timer_sec) or t
+    end
+    post_shot.effect_until = os.clock() + math.max(0.01, t or 0.01)
+    if resolved == "hide" and laser_trail_gameobject and laser_trail_gameobject.get_Valid and laser_trail_gameobject:get_Valid() then
+      pcall(function() laser_trail_gameobject:set_DrawSelf(false) end)
+    end
+    if resolved == "dim" then
+      post_shot.try_capture_and_dim_emissive()
+    end
+  end
+  local hooked = false
+  pcall(function()
+    local td = sdk.find_type_definition(sdk.game_namespace("BulletShellGenerator"))
+    if td then
+      local m = td:get_method("requestFire")
+      if m then sdk.hook(m, on_pre_request_fire_hide_laser, nil); hooked = true end
+    end
+  end)
+  pcall(function()
+    local td = sdk.find_type_definition(sdk.game_namespace("ShotgunShellGenerator"))
+    if td then
+      local m = td:get_method("requestFire")
+      if m then sdk.hook(m, on_pre_request_fire_hide_laser, nil); hooked = true end
+    end
+  end)
+  if hooked then post_shot_hide_hooks_installed = true end
 end
 
 --hook for bullet shell generation only used for bolt thrower mine since there is a bug when setting in weapon catalog
@@ -1073,8 +1497,21 @@ local function save_config()
       default_crosshair_overlay = default_crosshair_overlay,
       default_crosshair_detonemap = default_crosshair_detonemap,
       default_crosshair_depth_test = default_crosshair_depth_test,
+      crosshair_hide_after_shot = post_shot.crosshair_after.enabled,
+      crosshair_hide_after_shot_timer_sec = post_shot.crosshair_after.timer_sec,
       enable_laser_trail = enable_laser_trail,  -- Add laser trail settings
       laser_trail_scale = laser_trail_scale,
+      hide_laser_after_shot = post_shot.hide_laser,
+      hide_laser_after_shot_timer_sec = post_shot.timer_sec,
+      hide_laser_after_shot_restrict_to_list = false,
+      hide_laser_after_shot_weapon_ids = {},
+      post_shot_temp_dim_dot_beam = post_shot.dim_enabled,
+      post_shot_dim_restrict_to_list = false,
+      post_shot_dim_weapon_ids = {},
+      post_shot_dim_dot_scale = post_shot.dim_dot_scale,
+      post_shot_dim_glow_saturation = post_shot.dim_glow_saturation,
+      post_shot_dim_intensity = post_shot.dim_intensity_dim,
+      post_shot_per_weapon = post_shot.per_weapon,
       knife_dot_scale = knife_dot_scale,  -- Add knife dot scale
       laser_origin_offsets = laser_origin_offsets,    -- Persist weapon-specific offsets
       laser_mat_params = _G.laser_mat_params,        -- Persist material editor params
@@ -1085,9 +1522,17 @@ local function save_config()
       knife_dot_color_array = knife_dot_color_array,
       static_reticle_color_array = static_reticle_color_array,  -- Static reticle color when weapon laser disabled
       laser_color_array = laser_color_array, -- Keep for legacy compatibility
+      focused_laser_separate = focused_laser_colors.enabled,
+      focused_laser_dot = focused_laser_colors.dot,
+      focused_laser_beam = focused_laser_colors.beam,
+      focused_laser_match_dot_beam = focused_laser_colors.match_focused_dot_beam,
+      focused_laser_glow = focused_laser_colors.glow,
+      match_main_dot_beam = post_shot.match_main_dot_beam,
       weapon_laser_enabled = weapon_laser_enabled,  -- Per-weapon laser enable
       perfect_accuracy_enabled = _G.classic_re4_laser_perfect_accuracy_enabled,  -- Perfect accuracy setting
       point_range_enabled = _G.classic_re4_laser_point_range_enabled,  -- Point range setting
+      perfect_accuracy_only_when_laser_active = perfect_accuracy_only_when_laser_active,
+      perfect_focus_only_when_laser_active = perfect_focus_only_when_laser_active,
   }
   local success, err = pcall(json.dump_file, config_file, data)
   if not success then
@@ -1097,7 +1542,7 @@ end
 
 
 -- Apply loaded laser trail material params to the mesh/material
-local function apply_laser_trail_settings()
+apply_laser_trail_settings = function()
   if not laser_trail_gameobject then return end
   local mesh_component = laser_trail_gameobject:call("getComponent(System.Type)", sdk.typeof("via.render.Mesh"))
   if not mesh_component then return end
@@ -1111,10 +1556,14 @@ local function apply_laser_trail_settings()
             for k = 0, matParam - 1 do
               if mesh_component:getMaterialVariableName(j, k) == paramName then
                 local paramType = mesh_component:getMaterialVariableType(j, k)
-                if paramType == 1 then
-                  mesh_component:setMaterialFloat(j, k, value)
-                elseif paramType == 4 and type(value) == "table" then
-                  mesh_component:setMaterialFloat4(j, k, Vector4f.new(value[1], value[2], value[3], value[4]))
+                if paramType == 1 and mesh_component.setMaterialFloat then
+                  pcall(function() mesh_component:setMaterialFloat(j, k, value) end)
+                elseif paramType == 4 and type(value) == "table" and mesh_component.setMaterialFloat4 then
+                  local v4 = Vector4f.new(value[1], value[2], value[3], value[4])
+                  pcall(function() mesh_component:setMaterialFloat4(j, k, v4) end)
+                elseif paramName == "EmissiveIntensity" and type(value) == "number" and mesh_component.setMaterialFloat then
+                  -- Some builds report a non-1 type for this float; still push the value (same as material UI intent)
+                  pcall(function() mesh_component:setMaterialFloat(j, k, value) end)
                 end
               end
             end
@@ -1126,12 +1575,15 @@ local function apply_laser_trail_settings()
 end
 
 -- Function to apply beam color to the laser trail material
-local function apply_beam_color(color_array)
+-- persist_mat_params: when false, only updates the live mesh (runtime reticle-fitting tint); default true also writes _G.laser_mat_params for save/editor.
+local function apply_beam_color(color_array, persist_mat_params)
+  if persist_mat_params == nil then persist_mat_params = true end
   if not laser_trail_gameobject then return end
   local mesh_component = laser_trail_gameobject:call("getComponent(System.Type)", sdk.typeof("via.render.Mesh"))
   if not mesh_component or not mesh_component.setMaterialFloat4 then return end
   
   local matCount = mesh_component:get_MaterialNum()
+  local did_write = false
   for j = 0, matCount - 1 do
     local matName = mesh_component:getMaterialName(j)
     local matParam = mesh_component:getMaterialVariableNum(j)
@@ -1140,13 +1592,18 @@ local function apply_beam_color(color_array)
       if paramName == "EmissiveColor" then
         local color_vector = Vector4f.new(color_array[1], color_array[2], color_array[3], color_array[4])
         mesh_component:setMaterialFloat4(j, k, color_vector)
-        -- Also update the stored parameter
-        if not _G.laser_mat_params then _G.laser_mat_params = {} end
-        if not _G.laser_mat_params[matName] then _G.laser_mat_params[matName] = {} end
-        _G.laser_mat_params[matName][paramName] = {color_array[1], color_array[2], color_array[3], color_array[4]}
+        did_write = true
+        if persist_mat_params then
+          if not _G.laser_mat_params then _G.laser_mat_params = {} end
+          if not _G.laser_mat_params[matName] then _G.laser_mat_params[matName] = {} end
+          _G.laser_mat_params[matName][paramName] = {color_array[1], color_array[2], color_array[3], color_array[4]}
+        end
         break
       end
     end
+  end
+  if did_write then
+    focused_laser_colors.runtime_beam_sig = string.format("%s|%g|%g|%g|%g", tostring(persist_mat_params), color_array[1], color_array[2], color_array[3], color_array[4] or 1.0)
   end
 end
 
@@ -1190,8 +1647,54 @@ local function load_config()
   if data.default_crosshair_overlay ~= nil then default_crosshair_overlay = data.default_crosshair_overlay end
   if data.default_crosshair_detonemap ~= nil then default_crosshair_detonemap = data.default_crosshair_detonemap end
   if data.default_crosshair_depth_test ~= nil then default_crosshair_depth_test = data.default_crosshair_depth_test end
+  if data.crosshair_hide_after_shot ~= nil then post_shot.crosshair_after.enabled = data.crosshair_hide_after_shot == true end
+  if data.crosshair_hide_after_shot_timer_sec ~= nil then
+    post_shot.crosshair_after.timer_sec = math.max(0.01, math.min(10.0, tonumber(data.crosshair_hide_after_shot_timer_sec) or 0.25))
+  end
   enable_laser_trail = data.enable_laser_trail or enable_laser_trail
   laser_trail_scale = data.laser_trail_scale or laser_trail_scale
+  if data.hide_laser_after_shot ~= nil then post_shot.hide_laser = data.hide_laser_after_shot end
+  if data.hide_laser_after_shot_timer_sec ~= nil then
+    post_shot.timer_sec = math.max(0.01, math.min(10.0, tonumber(data.hide_laser_after_shot_timer_sec) or 0.2))
+  end
+  -- Legacy keys hide_laser_after_shot_restrict_to_list / weapon_ids / dim list: ignored; use per-weapon Off to exclude.
+  post_shot.restrict_list = false
+  post_shot.dim_restrict_list = false
+  post_shot.weapon_ids = {}
+  post_shot.dim_weapon_ids = {}
+  if data.post_shot_temp_dim_dot_beam ~= nil then post_shot.dim_enabled = data.post_shot_temp_dim_dot_beam == true end
+  if data.post_shot_dim_dot_scale ~= nil then
+    post_shot.dim_dot_scale = math.max(0.0, math.min(2.0, tonumber(data.post_shot_dim_dot_scale) or post_shot.dim_dot_scale))
+  end
+  if data.post_shot_dim_glow_saturation ~= nil then
+    post_shot.dim_glow_saturation = math.max(1.0, math.min(100.0, tonumber(data.post_shot_dim_glow_saturation) or post_shot.dim_glow_saturation))
+  end
+  if data.post_shot_dim_intensity ~= nil then
+    post_shot.dim_intensity_dim = snap_post_shot_dim_emissive(tonumber(data.post_shot_dim_intensity) or post_shot.dim_intensity_dim)
+  end
+  post_shot.per_weapon = {}
+  if type(data.post_shot_per_weapon) == "table" then
+    for k, v in pairs(data.post_shot_per_weapon) do
+      if type(k) == "string" and type(v) == "table" then
+        local mode = v.mode
+        if mode ~= "global" and mode ~= "off" and mode ~= "hide" and mode ~= "dim" then mode = "global" end
+        local row = { mode = mode }
+        if type(v.timer_sec) == "number" then
+          row.timer_sec = math.max(0.01, math.min(10.0, v.timer_sec))
+        end
+        if type(v.dim_dot_scale) == "number" then
+          row.dim_dot_scale = math.max(0.0, math.min(2.0, v.dim_dot_scale))
+        end
+        if type(v.dim_glow_saturation) == "number" then
+          row.dim_glow_saturation = math.max(1.0, math.min(100.0, v.dim_glow_saturation))
+        end
+        if type(v.dim_intensity_dim) == "number" then
+          row.dim_intensity_dim = snap_post_shot_dim_emissive(v.dim_intensity_dim)
+        end
+        post_shot.per_weapon[k] = row
+      end
+    end
+  end
   knife_dot_scale = data.knife_dot_scale or knife_dot_scale
   
   -- Load separate beam and dot colors
@@ -1221,6 +1724,54 @@ local function load_config()
     laser_dot_color_array = sanitize_color_array({data.laser_color_array[1], data.laser_color_array[2], data.laser_color_array[3], data.laser_color_array[4]}, laser_dot_color_array)
   end
   laser_color_array = laser_dot_color_array -- Keep legacy compatibility
+
+  if data.focused_laser_separate ~= nil then
+    focused_laser_colors.enabled = data.focused_laser_separate == true
+  elseif data.reticle_fitting_laser_colors ~= nil then
+    focused_laser_colors.enabled = data.reticle_fitting_laser_colors == true
+  end
+  if data.focused_laser_dot then
+    focused_laser_colors.dot = sanitize_color_array(data.focused_laser_dot, focused_laser_colors.dot)
+  elseif data.laser_dot_reticle_fitting_color_array then
+    focused_laser_colors.dot = sanitize_color_array(data.laser_dot_reticle_fitting_color_array, focused_laser_colors.dot)
+  else
+    focused_laser_colors.dot = sanitize_color_array(focused_laser_colors.dot, focused_laser_colors.dot)
+  end
+  if data.focused_laser_beam then
+    focused_laser_colors.beam = sanitize_color_array(data.focused_laser_beam, focused_laser_colors.beam)
+  elseif data.laser_beam_reticle_fitting_color_array then
+    focused_laser_colors.beam = sanitize_color_array(data.laser_beam_reticle_fitting_color_array, focused_laser_colors.beam)
+  else
+    focused_laser_colors.beam = sanitize_color_array(focused_laser_colors.beam, focused_laser_colors.beam)
+  end
+  if data.focused_laser_match_dot_beam ~= nil then
+    focused_laser_colors.match_focused_dot_beam = data.focused_laser_match_dot_beam == true
+  elseif data.reticle_fitting_match_focused_dot_beam ~= nil then
+    focused_laser_colors.match_focused_dot_beam = data.reticle_fitting_match_focused_dot_beam == true
+  elseif data.reticle_fitting_match_scoped_dot_beam ~= nil then
+    focused_laser_colors.match_focused_dot_beam = data.reticle_fitting_match_scoped_dot_beam == true
+  end
+  if data.focused_laser_glow ~= nil then
+    focused_laser_colors.glow = math.max(0.0, math.min(100.0, tonumber(data.focused_laser_glow) or focused_laser_colors.glow))
+  elseif data.reticle_fitting_glow ~= nil then
+    focused_laser_colors.glow = math.max(0.0, math.min(100.0, tonumber(data.reticle_fitting_glow) or focused_laser_colors.glow))
+  end
+  if data.match_main_dot_beam ~= nil then
+    post_shot.match_main_dot_beam = data.match_main_dot_beam == true
+  end
+  if post_shot.match_main_dot_beam then
+    laser_beam_color_array = {
+      laser_dot_color_array[1], laser_dot_color_array[2], laser_dot_color_array[3],
+      laser_dot_color_array[4] or 1.0,
+    }
+  end
+  if focused_laser_colors.match_focused_dot_beam then
+    focused_laser_colors.beam = {
+      focused_laser_colors.dot[1], focused_laser_colors.dot[2], focused_laser_colors.dot[3],
+      focused_laser_colors.dot[4] or 1.0,
+    }
+  end
+  focused_laser_colors.runtime_beam_sig = nil
   
   if data.laser_origin_offsets then
     laser_origin_offsets = data.laser_origin_offsets
@@ -1241,7 +1792,14 @@ local function load_config()
   if data.point_range_enabled ~= nil then
     _G.classic_re4_laser_point_range_enabled = data.point_range_enabled
   end
-  
+  if data.perfect_accuracy_only_when_laser_active ~= nil then
+    perfect_accuracy_only_when_laser_active = data.perfect_accuracy_only_when_laser_active == true
+  end
+  if data.perfect_focus_only_when_laser_active ~= nil then
+    perfect_focus_only_when_laser_active = data.perfect_focus_only_when_laser_active == true
+  end
+  classic_laser_trail_effective_prev = nil
+
   -- Update global flag for other mods to know Classic vs Remake bullet spawn per weapon
   update_spawn_flag()
   
@@ -1267,8 +1825,15 @@ local function is_perfect_accuracy_enabled()
     end
     
     local flag = _G.classic_re4_laser_perfect_accuracy_enabled
-    -- Default to true if never set, otherwise use the actual value
-    return flag ~= false
+    local base = flag ~= false
+    if perfect_accuracy_only_when_laser_active then
+      local ironsight_active = rawget(_G, "standalone_iron_sight_active") == true
+      local ironsight_pa = ironsight_active and rawget(_G, "standalone_perfect_accuracy_enabled") == true
+      if not ironsight_pa then
+        base = base and classic_laser_active_for_perfect
+      end
+    end
+    return base
 end
 
 local cast_ray_async = CastRays.cast_ray_async
@@ -1352,13 +1917,21 @@ local function create_laser_trail()
   
   -- Apply initial beam color from laser_beam_color_array to ensure beam starts with correct color
   apply_beam_color(laser_beam_color_array)
+  -- apply_beam_color resets mesh from params; re-apply post-shot dim laser intensity if that window is still active
+  if post_shot.dim_effectively_active() then
+    post_shot.try_capture_and_dim_emissive()
+  end
 end
 
 local function destroy_laser_trail()
-if laser_trail_gameobject then
-  laser_trail_gameobject:call("destroy", laser_trail_gameobject)
-  laser_trail_gameobject = nil
-end
+  if laser_trail_gameobject then
+    if post_shot.dim_mat_table_backup and next(post_shot.dim_mat_table_backup) then
+      post_shot.restore_dim_material_from_saved()
+    end
+    laser_trail_gameobject:call("destroy", laser_trail_gameobject)
+    laser_trail_gameobject = nil
+    focused_laser_colors.runtime_beam_sig = nil
+  end
 end
 
 -- Clean up laser trail when scripts are reset (prevents frozen leftover trails)
@@ -1390,6 +1963,8 @@ re.on_script_reset(function()
   hasRunInitially = false
   _G.is_aim = false
   _G.is_reticle_displayed = false
+  _G.focused_laser_aim = false
+  _G.is_reticle_fitting = false -- legacy alias for mods; mirrors focused_laser_aim
   
   -- Clear the laser trail game object reference
   laser_trail_gameobject = nil
@@ -1467,6 +2042,10 @@ global_intersection_point = re4.crosshair_pos
 end
 
 local function update_muzzle_and_laser_data()
+_G.focused_laser_aim = false
+_G.is_reticle_fitting = false -- legacy alias for mods
+spread_refresh_bt_gun = nil
+spread_refresh_weapon_id = nil
 if not scene then
   return
 end
@@ -1667,6 +2246,16 @@ local ok_gun, bt_gun = pcall(cached_gun_obj.call, cached_gun_obj, "getComponent(
 local ok_arms, bt_arms = pcall(cached_gun_obj.call, cached_gun_obj, "getComponent(System.Type)", sdk.typeof("chainsaw.Arms"))
 if not ok_gun then bt_gun = nil end
 if not ok_arms then bt_arms = nil end
+if ok_gun and bt_gun and is_valid_managed(bt_gun) then
+  local ok_rf, rf = pcall(function() return bt_gun:get_field("_IsReticleFitting") end)
+  if (not ok_rf or rf == nil) and bt_gun.call then
+    ok_rf, rf = pcall(function() return bt_gun:call("get_IsReticleFitting") end)
+  end
+  if ok_rf and rf ~= nil then
+    _G.focused_laser_aim = (rf == true)
+    _G.is_reticle_fitting = _G.focused_laser_aim -- legacy alias for mods (chainsaw.Gun._IsReticleFitting)
+  end
+end
 local muzzle_joint = nil
 if bt_arms then
   muzzle_joint = bt_arms:call("getMuzzleJoint")
@@ -1711,8 +2300,19 @@ end
 
 -- Update perfect accuracy spread state (only when weapon or setting changes)
 if bt_gun then
-  update_spread_state(bt_gun, equip_weapon)
+  spread_refresh_bt_gun = bt_gun
+  spread_refresh_weapon_id = equip_weapon
+  if not perfect_accuracy_only_when_laser_active then
+    update_spread_state(bt_gun, equip_weapon)
+  end
 end
+end
+
+local function update_spread_state_after_laser_trail_if_needed()
+  if not perfect_accuracy_only_when_laser_active then return end
+  if spread_refresh_bt_gun and spread_refresh_weapon_id then
+    update_spread_state(spread_refresh_bt_gun, spread_refresh_weapon_id)
+  end
 end
 
 local function update_static_dot_interpolation()
@@ -1853,13 +2453,22 @@ local function update_laser_trail()
 -- Hide trail when simple static mode is enabled AND laser is toggled off (showing backup dot)
 -- Hide trail when static mode is enabled and there's no new muzzle data
 
--- Skip drawing for several frames after mode switch to prevent stale position flash
-if skip_trail_frames > 0 then
-  skip_trail_frames = skip_trail_frames - 1
-  if laser_trail_gameobject then
-    laser_trail_gameobject:set_DrawSelf(false)
-  end
-  return
+-- Clear finished post-shot shot state (so firing_mode does not linger after the window)
+if post_shot.firing_weapon_id and post_shot.effect_until > 0.0 and os.clock() >= post_shot.effect_until then
+  post_shot.firing_weapon_id = nil
+  post_shot.firing_mode = nil
+  post_shot.effect_until = 0.0
+end
+
+if post_shot.crosshair_after.weapon_id and post_shot.crosshair_after.effect_until > 0.0
+    and os.clock() >= post_shot.crosshair_after.effect_until then
+  post_shot.crosshair_after.weapon_id = nil
+  post_shot.crosshair_after.effect_until = 0.0
+end
+
+-- Restore beam material when post-shot dim laser ends (runtime-only; not written to config)
+if post_shot.dim_mat_table_backup and next(post_shot.dim_mat_table_backup) and not post_shot.dim_effectively_active() then
+  post_shot.restore_dim_material_from_saved()
 end
 
 -- Check if laser is enabled for current weapon (default to enabled if not set)
@@ -1873,7 +2482,8 @@ local is_knife_weapon = current_weapon_id and ((current_weapon_id >= 5000 and cu
 
 -- Weapon 4005 always uses simple static mode internally
 local effective_simple_static = simple_static_mode or (current_weapon_id == 4005)
-local should_show = enable_laser_trail and re4.last_muzzle_pos and not is_non_muzzle_weapon and _G.is_aim and not (effective_simple_static and not show_laser_dot) and not has_stale_muzzle_data and laser_enabled_for_weapon and not is_weapon_changing and not is_knife_weapon
+local post_shot_hide_active = post_shot.hide_effectively_active()
+local should_show = enable_laser_trail and re4.last_muzzle_pos and not is_non_muzzle_weapon and _G.is_aim and not (effective_simple_static and not show_laser_dot) and not has_stale_muzzle_data and laser_enabled_for_weapon and not is_weapon_changing and not is_knife_weapon and not post_shot_hide_active
 
 -- Update last active time when trail should be shown
 if should_show then
@@ -1881,7 +2491,25 @@ if should_show then
 end
 
 -- Use 0.15-second grace period after stopping aim, but NOT for knife weapons (instant disable)
-local within_grace_period = not is_knife_weapon and (os.clock() - last_laser_trail_active_time) < 0.15
+-- Do not apply grace during post-shot hide or the trail would turn back on for ~0.15s after each shot.
+local within_grace_period = not is_knife_weapon and not post_shot_hide_active and (os.clock() - last_laser_trail_active_time) < 0.15
+
+-- Perfect Accuracy / Focus gate: must match trail intent even when skip_trail_frames hides drawing only.
+classic_laser_active_for_perfect = should_show or within_grace_period
+
+-- Skip drawing for several frames after mode switch to prevent stale position flash (does not clear laser gate above)
+if skip_trail_frames > 0 then
+  skip_trail_frames = skip_trail_frames - 1
+  if laser_trail_gameobject then
+    laser_trail_gameobject:set_DrawSelf(false)
+  end
+  return
+end
+
+-- Dim laser EmissiveIntensity must run even when the trail is hidden (post-shot hide), before early return
+if post_shot.dim_effectively_active() then
+  post_shot.try_capture_and_dim_emissive()
+end
 
 if not should_show and not within_grace_period then
   if laser_trail_gameobject then
@@ -1995,9 +2623,21 @@ local rotation_quat = default_forward:to_quat():slerp(beam_direction:to_quat(), 
 laser_transform:set_Rotation(rotation_quat)
 local beam_scale = laser_trail_scale
 laser_transform:set_LocalScale(Vector3f.new(beam_scale, beam_scale, distance/7.7)) --maybe change mesh size instead of dividing
+
+local eff_beam = laser_beam_color_array
+local persist_beam_params = true
+if focused_laser_colors.enabled and _G.focused_laser_aim then
+  eff_beam = (focused_laser_colors.match_focused_dot_beam and focused_laser_colors.dot) or focused_laser_colors.beam
+  persist_beam_params = false
+end
+local sig = string.format("%s|%g|%g|%g|%g", tostring(persist_beam_params), eff_beam[1], eff_beam[2], eff_beam[3], eff_beam[4] or 1.0)
+if sig ~= focused_laser_colors.runtime_beam_sig then
+  apply_beam_color(eff_beam, persist_beam_params)
+end
 end
 
 re.on_pre_application_entry("LockScene", function()
+install_post_shot_laser_hide_hooks()
 -- Determine aiming state (is_aim) using CharacterContext, similar to reference
 local character_manager = sdk.get_managed_singleton(sdk.game_namespace("CharacterManager"))
 local CharacterContext = nil
@@ -2134,6 +2774,7 @@ if (os.clock() - last_crosshair_time) < 1.0 then
     
   end
   update_laser_trail() -- Keep trail and muzzle data in sync
+  update_spread_state_after_laser_trail_if_needed()
 else
   update_muzzle_and_laser_data()
 
@@ -2141,9 +2782,15 @@ else
   if not scene then
     return
   end
+  -- Post-shot dim laser / hide must keep running while the effect window is open; otherwise try_capture
+  -- and trail visibility stop updating until crosshair data is fresh again.
+  if post_shot.firing_weapon_id and post_shot.effect_until > 0.0 and os.clock() < post_shot.effect_until then
+    update_laser_trail()
+    update_spread_state_after_laser_trail_if_needed()
+  end
 end
 
-
+maybe_refresh_point_range_after_laser_gate_changed()
 
 -- Check for laser/dot toggle hotkey
 local KM_controls = ((not Laser_settings.use_modifier or hk.check_hotkey("Laser Modifier", false)) and hk.check_hotkey("Laser Toggle")) or (hk.check_hotkey("Laser Modifier", true) and hk.check_hotkey("Laser Toggle"))
@@ -2498,7 +3145,7 @@ end)
 --]] -- #endregion
 
 -- Hook lateUpdate post-hook to override panel visibility after the game sets it
-local _hook_ok, _hook_err = pcall(function()
+pcall(function()
     local td = sdk.find_type_definition("chainsaw.ReticleGuiBehavior")
     --[[ # log (commented out)
     _dbg_log("H7", "hook_setup", "td_check", {td_found=tostring(td ~= nil)})
@@ -2524,9 +3171,6 @@ local _hook_ok, _hook_err = pcall(function()
     _dbg_log("H7", "hook_setup", "hook_installed", {success="true"})
     --]] -- #endregion
 end)
---[[ # log (commented out)
-_dbg_log("H7", "hook_setup", "pcall_result", {ok=tostring(_hook_ok), err=tostring(_hook_err)})
---]] -- #endregion
 
 -- Also run after all behaviors have updated, catches cases where lateUpdate
 -- hasn't fired yet (e.g. first load before aiming).
@@ -2600,6 +3244,11 @@ re.on_pre_gui_draw_element(function(element, context)
       return false  -- Block reticle drawing during frame skip
     end
   end
+
+  -- Post-shot laser hide + post-shot pistol crosshair hide: skip draw for laser reticle GUIs (Gui_ui2040 / Gui_ui2042)
+  if reticle_names[name] and (post_shot.hide_effectively_active() or post_shot.crosshair_hide_effectively_active()) then
+    return false
+  end
   
   -- Use 0.15s grace period matching the trail
   -- Weapon 4005 (Minecart Handgun) always processes reticle regardless of aim state
@@ -2669,10 +3318,16 @@ if reticle_names[name] then
       local laser_effectively_off_sat = not laser_enabled_for_weapon or not enable_laser_trail
       local sat = (show_default_crosshair_laser_off and laser_effectively_off_sat and not is_non_muzzle_weapon)
                   and default_crosshair_saturation or crosshair_saturation
+      if post_shot.dim_effectively_active() and not is_non_muzzle_weapon then
+        sat = post_shot.effective_dim_glow_saturation()
+      elseif focused_laser_colors.enabled and _G.focused_laser_aim and not is_non_muzzle_weapon then
+        sat = focused_laser_colors.glow
+      end
       color_panel:call("set_Saturation", sat)
       
       -- Set the scale using the GUI value - use different scales for knife vs regular weapons
-      local current_scale = is_non_muzzle_weapon and knife_dot_scale or dot_scale
+      local base_dot_scale = is_non_muzzle_weapon and knife_dot_scale or dot_scale
+      local current_scale = (post_shot.dim_effectively_active() and not is_non_muzzle_weapon) and post_shot.effective_dim_dot_scale() or base_dot_scale
       local scale_vec = Vector3f.new(current_scale, current_scale, current_scale)
       color_panel:call("set_Scale", scale_vec)
     end
@@ -2684,7 +3339,9 @@ if reticle_names[name] then
   if type_panel and skip_type_panel_override then
     local current_color = type_panel:call("get_ColorScale")
     if current_color then
-      local src = default_crosshair_match_laser and laser_dot_color_array or default_crosshair_color_array
+      local src = default_crosshair_match_laser
+          and (((focused_laser_colors.enabled and _G.focused_laser_aim) and focused_laser_colors.dot) or laser_dot_color_array)
+          or default_crosshair_color_array
       current_color.x = src[1] or 1.0
       current_color.y = src[2] or 1.0
       current_color.z = src[3] or 1.0
@@ -2693,7 +3350,8 @@ if reticle_names[name] then
     end
   elseif type_panel then
     -- Use different scales for knife vs regular weapons
-    local current_scale = is_non_muzzle_weapon and knife_dot_scale or dot_scale
+    local base_dot_scale = is_non_muzzle_weapon and knife_dot_scale or dot_scale
+    local current_scale = (post_shot.dim_effectively_active() and not is_non_muzzle_weapon) and post_shot.effective_dim_dot_scale() or base_dot_scale
     local scale_vec = Vector3f.new(current_scale, current_scale, current_scale)
     type_panel:call("set_Scale", scale_vec)
     
@@ -2703,6 +3361,7 @@ if reticle_names[name] then
       if not is_non_muzzle_weapon then
         -- Handle dot visibility based on hotkey state and weapon laser settings
         -- Note: IronSight/FP+Preset hiding is already handled by early return above
+        local eff_dot = ((focused_laser_colors.enabled and _G.focused_laser_aim) and focused_laser_colors.dot) or laser_dot_color_array
         
         -- Weapon 4005 (Minecart Handgun) always shows dot reticle
         local force_show_dot_4005 = (current_weapon_id == 4005)
@@ -2729,9 +3388,9 @@ if reticle_names[name] then
           local effective_simple_static = simple_static_mode or (current_weapon_id == 4005)
           if effective_simple_static then
             -- Simple static mode enabled: show custom colored backup dot
-            current_color.x = laser_color_array[1] or 1.0
-            current_color.y = laser_color_array[2] or 0.0
-            current_color.z = laser_color_array[3] or 0.0
+            current_color.x = eff_dot[1] or 1.0
+            current_color.y = eff_dot[2] or 0.0
+            current_color.z = eff_dot[3] or 0.0
             current_color.w = 1.0  -- Fully visible
           else
             -- Normal behavior when laser is off: hide dot
@@ -2742,9 +3401,9 @@ if reticle_names[name] then
           end
         else
           -- Laser is toggled ON via hotkey: show normal colored dot regardless of simple static mode
-          current_color.x = laser_color_array[1] or 1.0
-          current_color.y = laser_color_array[2] or 0.0
-          current_color.z = laser_color_array[3] or 0.0
+          current_color.x = eff_dot[1] or 1.0
+          current_color.y = eff_dot[2] or 0.0
+          current_color.z = eff_dot[3] or 0.0
           current_color.w = 1.0   -- Fully visible
         end
         type_panel:call("set_ColorScale", current_color)
@@ -2783,12 +3442,15 @@ if reticle_names[name] then
   if not view then
     return true
   end
+
+  -- Minecart handgun (4005): this reticle View uses ViewType 0 for flat/center crosshair; force it (saved combo may still say "3D").
+  local crosshair_vt = (current_weapon_id == 4005) and 0 or default_crosshair_view_type
   
   local laser_currently_active = laser_enabled_for_weapon and enable_laser_trail and not is_non_muzzle_weapon
   if laser_currently_active then
     view:call("set_Overlay", false)
   elseif show_default_crosshair_laser_off and laser_effectively_off and not is_non_muzzle_weapon then
-    view:call("set_ViewType", default_crosshair_view_type)
+    view:call("set_ViewType", crosshair_vt)
     view:call("set_Overlay", default_crosshair_overlay)
     view:call("set_Detonemap", default_crosshair_detonemap)
     view:call("set_DepthTest", default_crosshair_depth_test)
@@ -2798,7 +3460,7 @@ if reticle_names[name] then
   -- Weapon 4005 always uses simple static mode regardless of checkbox state
   local effective_simple_static = simple_static_mode or (current_weapon_id == 4005)
   if (effective_simple_static and not show_laser_dot) or not laser_enabled_for_weapon or (current_weapon_id == 4005) then
-    view:call("set_ViewType", default_crosshair_view_type)
+    view:call("set_ViewType", crosshair_vt)
     view:call("set_Overlay", default_crosshair_overlay)
     view:call("set_Detonemap", default_crosshair_detonemap)
     view:call("set_DepthTest", default_crosshair_depth_test)
@@ -2811,7 +3473,7 @@ if reticle_names[name] then
     -- Static center positioning (RE4 Remake Style)
     local crosshair_active = show_default_crosshair_laser_off and laser_effectively_off and not is_non_muzzle_weapon
     if cached_static_intersection_point and re4.crosshair_dir then
-      view:call("set_ViewType", crosshair_active and default_crosshair_view_type or 1)
+      view:call("set_ViewType", crosshair_active and crosshair_vt or 1)
       if crosshair_active then
         view:call("set_Overlay", default_crosshair_overlay)
         view:call("set_Detonemap", default_crosshair_detonemap)
@@ -2854,7 +3516,7 @@ if reticle_names[name] then
     -- Dynamic positioning
     local crosshair_active_dyn = show_default_crosshair_laser_off and laser_effectively_off and not is_non_muzzle_weapon
     if global_intersection_point then
-      view:call("set_ViewType", crosshair_active_dyn and default_crosshair_view_type or 1)
+      view:call("set_ViewType", crosshair_active_dyn and crosshair_vt or 1)
       if crosshair_active_dyn then
         view:call("set_Overlay", default_crosshair_overlay)
         view:call("set_Detonemap", default_crosshair_detonemap)
@@ -3203,8 +3865,12 @@ local function updateReticles()
             original_point_ranges[cacheKey] = {s = pointRange.s, r = pointRange.r}
           end
           
-          if isRifle or _G.classic_re4_laser_point_range_enabled ~= false then
-            -- Rifles always get 100 point range, others only when setting enabled
+          local pf_master = _G.classic_re4_laser_point_range_enabled ~= false
+          if perfect_focus_only_when_laser_active then
+            pf_master = pf_master and classic_laser_active_for_perfect
+          end
+          if isRifle or pf_master then
+            -- Rifles always get 100 point range, others only when Perfect Focus (and laser gate if enabled) applies
             pointRange.s = 100
             pointRange.r = 100
             write_valuetype(param, 0x10, pointRange)
@@ -3266,7 +3932,7 @@ local function updateReticles()
   end
 end
 
-local function resetValues()        
+function classic_re4_laser_reset_values()
   scene_manager = nil
   scene = nil
   hasRunInitially = false
@@ -3285,25 +3951,22 @@ end
 
 re.on_pre_application_entry("LockScene", function()
   if re4.player == nil then       
-      resetValues()
+      classic_re4_laser_reset_values()
       return
   end
   if re4.body == nil then        
-      resetValues()
+      classic_re4_laser_reset_values()
       return
   end
 
   local camera = sdk.get_primary_camera()    
   if not camera then
-      resetValues()
+      classic_re4_laser_reset_values()
       return
   end
 
-  if not hasRunInitially then    
-      updateReticles()
-      hasRunInitially = true     
-  end
-  
+  local need_initial_reticles = not hasRunInitially
+
   -- Always update muzzle and laser every frame  
     update_muzzle_and_laser_data()
 
@@ -3317,6 +3980,13 @@ re.on_pre_application_entry("LockScene", function()
   end
 
   update_laser_trail() -- Keep trail and muzzle data in sync
+  update_spread_state_after_laser_trail_if_needed()
+  maybe_refresh_point_range_after_laser_gate_changed()
+
+  if need_initial_reticles then
+    updateReticles()
+    hasRunInitially = true
+  end
 
   -- Enforce reticle panel visibility every frame for consistency
   pcall(apply_reticle_panel_override)
@@ -3363,9 +4033,21 @@ re.on_draw_ui(function()
       imgui.same_line()
       imgui.text_colored("+ Perfect Focus", 0xFFEECC66)
     end
+    if perfect_accuracy_only_when_laser_active then
+      imgui.same_line()
+      imgui.text_colored("+ PA when laser", 0xFF88CCAA)
+    end
+    if perfect_focus_only_when_laser_active then
+      imgui.same_line()
+      imgui.text_colored("+ PF when laser", 0xFFCCAA88)
+    end
     
     imgui.spacing()
-    
+
+    imgui.begin_rect()
+    imgui.text_colored(" Select Style:", 0xFFFFFFAA)
+    imgui.spacing()
+
     local muzzle_mode = not static_center_dot
     if muzzle_mode then
         imgui.push_style_color(2, 0.2, 0.8, 0.2, 1.0) -- Green tint for active
@@ -3390,6 +4072,8 @@ re.on_draw_ui(function()
     if imgui.is_item_hovered() then
         imgui.set_tooltip("Laser always centered on screen")
     end
+
+    imgui.end_rect(1)
     
     if muzzle_changed then
         if muzzle_new then
@@ -3415,85 +4099,21 @@ re.on_draw_ui(function()
         manage_hooks(true)
     end
     
-    -- Quick Options
+    -- Quick Options (Main options)
     imgui.begin_rect()
-    
-    -- Check if current weapon has laser disabled (hide Enable Dot Reticle option since dot is always shown)
-    local weapon_id_str = current_weapon_id and tostring(current_weapon_id) or "unknown"
-    local laser_disabled_for_current_weapon = weapon_laser_enabled[weapon_id_str] == false
-    
-    --[[ Enable default crosshair (disabled)
-    if not laser_disabled_for_current_weapon then
-      local simple_static_changed = false
-      simple_static_changed, simple_static_mode = imgui.checkbox("Enable default crosshair", simple_static_mode)
-      if imgui.is_item_hovered() then
-          imgui.set_tooltip("Enable completely static dot reticle when laser is off")
-      end
-      if simple_static_changed then
-          save_config()
-      end
-      
-      imgui.same_line()
-    end
-    --]]
-    
-    corrector_changed, disable_shoulder_corrector = imgui.checkbox("Disable Shoulder Corrector", disable_shoulder_corrector)
-    if imgui.is_item_hovered() then
-        imgui.set_tooltip("Disable weapon shoulder correction (removes auto centering of the arms and laser dot when aiming for Classic RE4 Laser. Has no effect on laser positioning for RE4 Remake Style)")
-    end
-    if corrector_changed then
-        save_config()
-        hasRunInitially = false
-    end
-    
-    imgui.same_line()
-    
-    -- Perfect Accuracy checkbox
-    local perfect_accuracy_enabled = _G.classic_re4_laser_perfect_accuracy_enabled ~= false
-    local pa_changed, pa_new = imgui.checkbox("Perfect Accuracy##classic_laser_perfect_accuracy", perfect_accuracy_enabled)
-    if pa_changed then
-        _G.classic_re4_laser_perfect_accuracy_enabled = pa_new
-        hasRunInitially = false  -- Force re-run updateReticles to apply/remove zero spread
-        save_config()  -- Save the setting immediately
-    end
-    
-    imgui.same_line()
-    
-    -- Point Range checkbox
-    local point_range_enabled = _G.classic_re4_laser_point_range_enabled ~= false
-    local pr_changed, pr_new = imgui.checkbox("Perfect Focus##classic_laser_point_range", point_range_enabled)
-    if pr_changed then
-        _G.classic_re4_laser_point_range_enabled = pr_new
-        hasRunInitially = false  -- Force re-run updateReticles to apply point range
-        save_config()  -- Save the setting immediately
-    end
-    
-    local hide_muzzle_changed = false
-    hide_muzzle_changed, hide_dot_when_no_muzzle = imgui.checkbox("Hide dot when using knife", hide_dot_when_no_muzzle)
-    if imgui.is_item_hovered() then
-        imgui.set_tooltip("Hide the laser dot/reticle when no weapon muzzle is detected (useful for clean screenshots or cutscenes)")
-    end
-    if hide_muzzle_changed then
-        save_config()
-    end
-    
-    local crosshair_off_changed = false
-    crosshair_off_changed, show_default_crosshair_laser_off = imgui.checkbox("Show crosshair when laser off", show_default_crosshair_laser_off)
-    if imgui.is_item_hovered() then
-        imgui.set_tooltip("When a weapon's laser is toggled off, the crosshair will show. *Laser behavior will temporarily show as Remake Style until laser is toggled back on.*")
-    end
-    if crosshair_off_changed then
-        reticle_needs_restore = true
-        save_config()
-    end
-    
+    imgui.text_colored(" Main options:", 0xFFFFFFAA)
     imgui.spacing()
+
     imgui.push_id("per_weapon_laser_section")
+    -- ImGuiCol_Text=0, ImGuiCol_Button=21; use ARGB u32 (REFramework), not float tuples.
+    imgui.push_style_color(0, 0xFF55EE88)
+    imgui.push_style_color(21, 0xFF1A3D22)
     if imgui.button("Per-Weapon Laser Enable/Disable...") then
       imgui.open_popup("per_weapon_laser_popup")
     end
+    imgui.pop_style_color(2)
     if imgui.is_item_hovered() then
-      imgui.set_tooltip("Select which weapons show the laser trail")
+      imgui.set_tooltip("Select which weapons have a laser")
     end
     if imgui.begin_popup("per_weapon_laser_popup") then
       imgui.text_colored(" Select weapons to show laser trail:", 0xFFFFFFAA)
@@ -3552,6 +4172,304 @@ re.on_draw_ui(function()
       imgui.end_popup()
     end
     imgui.pop_id()
+    imgui.spacing()
+
+    -- Check if current weapon has laser disabled (hide Enable Dot Reticle option since dot is always shown)
+    local weapon_id_str = current_weapon_id and tostring(current_weapon_id) or "unknown"
+    local laser_disabled_for_current_weapon = weapon_laser_enabled[weapon_id_str] == false
+    
+    --[[ Enable default crosshair (disabled)
+    if not laser_disabled_for_current_weapon then
+      local simple_static_changed = false
+      simple_static_changed, simple_static_mode = imgui.checkbox("Enable default crosshair", simple_static_mode)
+      if imgui.is_item_hovered() then
+          imgui.set_tooltip("Enable completely static dot reticle when laser is off")
+      end
+      if simple_static_changed then
+          save_config()
+      end
+      
+      imgui.same_line()
+    end
+    --]]
+    
+    corrector_changed, disable_shoulder_corrector = imgui.checkbox("Disable Shoulder Corrector", disable_shoulder_corrector)
+    if imgui.is_item_hovered() then
+        imgui.set_tooltip("Disable weapon shoulder correction (removes auto centering of the arms and laser dot when aiming for Classic RE4 Laser. Has no effect on laser positioning for RE4 Remake Style)")
+    end
+    if corrector_changed then
+        save_config()
+        hasRunInitially = false
+    end
+    
+    imgui.same_line()
+    
+    -- Perfect Accuracy checkbox
+    local perfect_accuracy_enabled = _G.classic_re4_laser_perfect_accuracy_enabled ~= false
+    local pa_changed, pa_new = imgui.checkbox("Perfect Accuracy##classic_laser_perfect_accuracy", perfect_accuracy_enabled)
+    if pa_changed then
+        _G.classic_re4_laser_perfect_accuracy_enabled = pa_new
+        hasRunInitially = false  -- Force re-run updateReticles to apply/remove zero spread
+        save_config()  -- Save the setting immediately
+    end
+    
+    imgui.same_line()
+    
+    -- Point Range checkbox
+    local point_range_enabled = _G.classic_re4_laser_point_range_enabled ~= false
+    local pr_changed, pr_new = imgui.checkbox("Perfect Focus##classic_laser_point_range", point_range_enabled)
+    if pr_changed then
+        _G.classic_re4_laser_point_range_enabled = pr_new
+        hasRunInitially = false  -- Force re-run updateReticles to apply point range
+        save_config()  -- Save the setting immediately
+    end
+
+    local pa_top = _G.classic_re4_laser_perfect_accuracy_enabled ~= false
+    local pr_top = _G.classic_re4_laser_point_range_enabled ~= false
+    if pa_top or pr_top then
+      imgui.spacing()
+    end
+
+    if pa_top then
+      local pa_laser_only_changed, pa_laser_only_new = imgui.checkbox("Perfect Accuracy only while laser is active##pa_only_when_laser", perfect_accuracy_only_when_laser_active)
+      if pa_laser_only_changed then
+        perfect_accuracy_only_when_laser_active = pa_laser_only_new
+        classic_laser_trail_effective_prev = nil
+        force_spread_update = true
+        hasRunInitially = false
+        save_config()
+      end
+      if imgui.is_item_hovered() then
+        imgui.set_tooltip("When enabled, Perfect Accuracy (zero spread) applies only while the classic muzzle laser trail is visible—aiming, laser not toggled off for the weapon, etc. Does not change Iron Sight mod behavior when its own perfect accuracy is active.")
+      end
+    end
+
+    if pa_top and pr_top then
+      imgui.spacing()
+    end
+
+    if pr_top then
+      local pf_laser_only_changed, pf_laser_only_new = imgui.checkbox("Perfect Focus only while laser is active##pf_only_when_laser", perfect_focus_only_when_laser_active)
+      if pf_laser_only_changed then
+        perfect_focus_only_when_laser_active = pf_laser_only_new
+        classic_laser_trail_effective_prev = nil
+        hasRunInitially = false
+        save_config()
+      end
+      if imgui.is_item_hovered() then
+        imgui.set_tooltip("When enabled, Perfect Focus (max point range on non-rifle weapons) applies only while the classic muzzle laser trail is visible. Rifles still always use max point range.")
+      end
+    end
+    
+    local hide_muzzle_changed = false
+    hide_muzzle_changed, hide_dot_when_no_muzzle = imgui.checkbox("Hide dot when using knife", hide_dot_when_no_muzzle)
+    if imgui.is_item_hovered() then
+        imgui.set_tooltip("Hide the laser dot/reticle when no weapon muzzle is detected (useful for clean screenshots or cutscenes)")
+    end
+    if hide_muzzle_changed then
+        save_config()
+    end
+    
+    local crosshair_off_changed = false
+    crosshair_off_changed, show_default_crosshair_laser_off = imgui.checkbox("Show crosshair when laser off", show_default_crosshair_laser_off)
+    if imgui.is_item_hovered() then
+        imgui.set_tooltip("When a weapon's laser is toggled off, the crosshair will show. *Laser behavior will temporarily show as Remake Style until laser is toggled back on.*")
+    end
+    if crosshair_off_changed then
+        reticle_needs_restore = true
+        save_config()
+    end
+
+    imgui.end_rect(1)
+    imgui.spacing()
+    imgui.begin_rect()
+    imgui.text_colored(" Hide/Dim Laser After Shot:", 0xFFFFFFAA)
+    imgui.text_colored("Global hide or dim laser applies to all laser enabled weapons unless a weapon is set to Off in Post-shot by weapon…", 0xFF888888)
+    imgui.text_colored("Post-shot by weapon… sets mode override, duration, and optional dim laser tuning per gun.", 0xFF888888)
+    imgui.spacing()
+    local has_changed_top, has_new_top = imgui.checkbox("Hide laser after each shot##hide_laser_after_shot", post_shot.hide_laser)
+    if has_changed_top then
+        post_shot.hide_laser = has_new_top
+        if has_new_top then post_shot.dim_enabled = false end
+        save_config()
+    end
+    if imgui.is_item_hovered() then
+        imgui.set_tooltip("After firing, hide the laser beam and dot until the timer below expires (re-enables automatically). Mutually exclusive with post-shot dim laser.")
+    end
+    local dim_changed_top, dim_new_top = imgui.checkbox("Post-shot dim laser##post_shot_temp_dim_dot_beam", post_shot.dim_enabled)
+    if dim_changed_top then
+        post_shot.dim_enabled = dim_new_top
+        if dim_new_top then post_shot.hide_laser = false end
+        save_config()
+    end
+    if imgui.is_item_hovered() then
+        imgui.set_tooltip("After each shot: reticle scale, glow, and laser beam EmissiveIntensity use the dim laser sliders in this section while the effect is active. Beam color unchanged. Mutually exclusive with hide-after-shot.")
+    end
+    if post_shot.hide_laser or post_shot.dim_enabled or (post_shot.per_weapon and next(post_shot.per_weapon) ~= nil) then
+      imgui.set_next_item_width(280)
+      local t_changed_top, t_new_top = imgui.drag_float("Post-shot duration (sec)##hide_laser_after_shot_timer", post_shot.timer_sec, 0.01, 0.01, 3.0, "%.2f")
+      if t_changed_top then
+          post_shot.timer_sec = t_new_top
+          save_config()
+      end
+      if imgui.is_item_hovered() then
+          imgui.set_tooltip("Global duration for post-shot hide/dim laser.")
+      end
+    end
+    if post_shot.dim_enabled then
+      imgui.spacing()
+      imgui.set_next_item_width(280)
+      local dim_scale_changed, dim_scale_new = imgui.drag_float("Dim laser: dot / crosshair scale##post_shot_dim_dot_scale", post_shot.dim_dot_scale, 0.005, 0.0, 2.0, "%.2f")
+      if dim_scale_changed then
+        post_shot.dim_dot_scale = dim_scale_new
+        save_config()
+      end
+      if imgui.is_item_hovered() then
+        imgui.set_tooltip("Reticle TypePanel/ColorPanel scale while post-shot dim laser is active (0–2; same axis as Dot/Crosshair Scale).")
+      end
+      imgui.set_next_item_width(280)
+      local dim_glow_changed, dim_glow_new = imgui.drag_float("Dim laser: glow##post_shot_dim_glow", post_shot.dim_glow_saturation, 0.25, 1.0, 100.0, "%.1f")
+      if dim_glow_changed then
+        post_shot.dim_glow_saturation = dim_glow_new
+        save_config()
+      end
+      if imgui.is_item_hovered() then
+        imgui.set_tooltip("ColorPanel glow while post-shot dim laser is active (same idea as the Glow slider).")
+      end
+      imgui.set_next_item_width(280)
+      local dim_int_changed, dim_int_new = imgui.drag_float("Dim laser: EmissiveIntensity##post_shot_dim_intensity", post_shot.dim_intensity_dim, 0.05, 0.0, 100.0, "%.2f")
+      if dim_int_changed then
+        post_shot.dim_intensity_dim = snap_post_shot_dim_emissive(dim_int_new)
+        save_config()
+      end
+      if imgui.is_item_hovered() then
+        imgui.set_tooltip("Laser beam material EmissiveIntensity while post-shot dim laser is active (same range as Laser Beam material editor).")
+      end
+    end
+    imgui.spacing()
+    if imgui.button("Per-Weapon Post-Shot Options…##post_shot_per_weapon_btn") then
+      local ordered_open = {}
+      for _, category in ipairs(weapon_categories) do
+        for _, wid in ipairs(category.ids) do
+          if wid ~= 4005 then
+            table.insert(ordered_open, wid)
+          end
+        end
+      end
+      post_shot_pw_popup_weapon_idx = 1
+      if current_weapon_id then
+        for i, wid in ipairs(ordered_open) do
+          if wid == current_weapon_id then
+            post_shot_pw_popup_weapon_idx = i
+            break
+          end
+        end
+      end
+      imgui.open_popup("ClassicRE4Laser_post_shot_per_weapon_popup")
+    end
+    if imgui.is_item_hovered() then
+      imgui.set_tooltip("Choose a weapon, then set mode: Use global, Off, or Hide/Dim laser after shot with optional duration and dim laser tuning.")
+    end
+    if imgui.begin_popup("ClassicRE4Laser_post_shot_per_weapon_popup") then
+      imgui.text_colored("Per-Weapon Post-Shot Options", 0xFFFFFFAA)
+      imgui.text_colored("Use global follows the Hide / Dim laser checkboxes for that weapon. Off disables post-shot for that weapon.", 0xFF888888)
+      imgui.text("Optional duration and dim laser sliders apply only while that weapon's mode is Hide after shot or Dim laser after shot.")
+      imgui.spacing()
+      local ordered_pw_ids = {}
+      local weapon_combo_labels = {}
+      for _, category in ipairs(weapon_categories) do
+        for _, wid in ipairs(category.ids) do
+          if wid ~= 4005 then
+            table.insert(ordered_pw_ids, wid)
+            local id_str_l = tostring(wid)
+            table.insert(weapon_combo_labels, weapon_names[wid] or ("Unknown (" .. id_str_l .. ")"))
+          end
+        end
+      end
+      local pw_n = #ordered_pw_ids
+      if pw_n < 1 then
+        imgui.text("No weapons in list.")
+      else
+        if post_shot_pw_popup_weapon_idx > pw_n then post_shot_pw_popup_weapon_idx = pw_n end
+        if post_shot_pw_popup_weapon_idx < 1 then post_shot_pw_popup_weapon_idx = 1 end
+        imgui.set_next_item_width(320)
+        local wcomb, w_new_idx = imgui.combo("Weapon##postshot_pw_weapon", post_shot_pw_popup_weapon_idx, weapon_combo_labels)
+        if wcomb then
+          post_shot_pw_popup_weapon_idx = w_new_idx
+        end
+        local wid = ordered_pw_ids[post_shot_pw_popup_weapon_idx]
+        local id_str = tostring(wid)
+        imgui.push_id("pwpost_" .. id_str)
+        imgui.spacing()
+        imgui.set_next_item_width(260)
+        local row_pre = post_shot.per_weapon and post_shot.per_weapon[id_str]
+        local mode_pre = (row_pre and row_pre.mode) or "global"
+        local combo_idx = post_shot.pw_mode_to_combo_idx(mode_pre)
+        -- Literal label table only: some ImGui bindings iterate with pairs() and must not see post_shot's function keys
+        local ccomb, new_idx = imgui.combo("Mode##postshot_pw_mode", combo_idx, { "Use global", "Off", "Hide after shot", "Dim laser after shot" })
+        if ccomb then
+          post_shot.per_weapon = post_shot.per_weapon or {}
+          local nm = post_shot.pw_combo_idx_to_mode(new_idx)
+          if nm == "global" then
+            post_shot.per_weapon[id_str] = nil
+          else
+            post_shot.per_weapon[id_str] = post_shot.per_weapon[id_str] or {}
+            post_shot.per_weapon[id_str].mode = nm
+          end
+          save_config()
+        end
+        local row = post_shot.per_weapon and post_shot.per_weapon[id_str]
+        if row and (row.mode == "hide" or row.mode == "dim") then
+          imgui.spacing()
+          imgui.set_next_item_width(260)
+          local dur_val = (row.timer_sec ~= nil) and row.timer_sec or post_shot.timer_sec
+          local dch, dnew = imgui.drag_float("Duration (sec)##postshot_pw_dur", dur_val, 0.01, 0.01, 3.0, "%.2f")
+          if dch then
+            row.timer_sec = dnew
+            save_config()
+          end
+          imgui.same_line()
+          if imgui.button("Default##postshot_pw_durclr") then
+            row.timer_sec = nil
+            save_config()
+          end
+          if row.mode == "dim" then
+            imgui.spacing()
+            imgui.set_next_item_width(260)
+            local vds = (row.dim_dot_scale ~= nil) and row.dim_dot_scale or post_shot.dim_dot_scale
+            local sch, sne = imgui.drag_float("Dim laser: dot scale##postshot_pw_ds", vds, 0.005, 0.0, 2.0, "%.2f")
+            if sch then
+              row.dim_dot_scale = sne
+              save_config()
+            end
+            imgui.set_next_item_width(260)
+            local vgs = (row.dim_glow_saturation ~= nil) and row.dim_glow_saturation or post_shot.dim_glow_saturation
+            local gch, gne = imgui.drag_float("Dim laser: glow##postshot_pw_glow", vgs, 0.25, 1.0, 100.0, "%.1f")
+            if gch then
+              row.dim_glow_saturation = gne
+              save_config()
+            end
+            imgui.set_next_item_width(260)
+            local vdi = (row.dim_intensity_dim ~= nil) and row.dim_intensity_dim or post_shot.dim_intensity_dim
+            local ich, ine = imgui.drag_float("Dim laser: intensity##postshot_pw_int", vdi, 0.05, 0.0, 100.0, "%.2f")
+            if ich then
+              row.dim_intensity_dim = snap_post_shot_dim_emissive(ine)
+              save_config()
+            end
+            if imgui.button("Use global dim laser sliders##postshot_pw_dimclr") then
+              row.dim_dot_scale = nil
+              row.dim_glow_saturation = nil
+              row.dim_intensity_dim = nil
+              save_config()
+            end
+          end
+        end
+        imgui.pop_id()
+      end
+      imgui.end_popup()
+    end
+    imgui.end_rect(1)
+
     --[[
     imgui.spacing()
     imgui.text_colored("Capture Defaults (Mode: " .. current_game_mode .. "):", 0xFFAAAAFF)
@@ -3627,8 +4545,6 @@ re.on_draw_ui(function()
     
     imgui.end_rect(1)
   --]]
-  
-  imgui.end_rect(1)
   
   imgui.spacing()
   
@@ -3728,6 +4644,23 @@ re.on_draw_ui(function()
   laser_beam_color_array = sanitize_color_array(laser_beam_color_array, {1.0, 0.0, 0.0, 1.0})
   knife_dot_color_array = sanitize_color_array(knife_dot_color_array, {1.0, 1.0, 1.0, 1.0})
   static_reticle_color_array = sanitize_color_array(static_reticle_color_array, {1.0, 1.0, 1.0, 1.0})
+
+  local mm_changed, mm_new = imgui.checkbox("Match dot & beam color##match_main_dot_beam", post_shot.match_main_dot_beam)
+  if mm_changed then
+      post_shot.match_main_dot_beam = mm_new
+      if post_shot.match_main_dot_beam then
+        laser_beam_color_array = {
+          laser_dot_color_array[1], laser_dot_color_array[2], laser_dot_color_array[3],
+          laser_dot_color_array[4] or 1.0,
+        }
+        apply_beam_color(laser_beam_color_array)
+      end
+      focused_laser_colors.runtime_beam_sig = nil
+      save_config()
+  end
+  if imgui.is_item_hovered() then
+      imgui.set_tooltip("When enabled, the beam uses the same color as the dot. Changing either picker keeps them in sync.")
+  end
   
   -- Color Pickers side by side - Dot first, then Beam
   local dot_color = {
@@ -3757,6 +4690,14 @@ re.on_draw_ui(function()
   
   if dot_color_changed then
       apply_dot_color(laser_dot_color_array)
+      if post_shot.match_main_dot_beam then
+        laser_beam_color_array = {
+          laser_dot_color_array[1], laser_dot_color_array[2], laser_dot_color_array[3],
+          laser_dot_color_array[4] or 1.0,
+        }
+        apply_beam_color(laser_beam_color_array)
+      end
+      focused_laser_colors.runtime_beam_sig = nil
       save_config()
   end
   
@@ -3787,7 +4728,15 @@ re.on_draw_ui(function()
   end
   
   if beam_color_changed then
+      if post_shot.match_main_dot_beam then
+        laser_dot_color_array = {
+          laser_beam_color_array[1], laser_beam_color_array[2], laser_beam_color_array[3],
+          laser_beam_color_array[4] or 1.0,
+        }
+        apply_dot_color(laser_dot_color_array)
+      end
       apply_beam_color(laser_beam_color_array)
+      focused_laser_colors.runtime_beam_sig = nil
       save_config()
   end
   
@@ -3819,6 +4768,108 @@ re.on_draw_ui(function()
   
   if knife_color_changed then
       save_config()
+  end
+
+  imgui.spacing()
+  local rfc_changed, rfc_new = imgui.checkbox("Separate dot/beam color when focused ##reticle_fit_colors", focused_laser_colors.enabled)
+  if rfc_changed then
+      focused_laser_colors.enabled = rfc_new
+      focused_laser_colors.runtime_beam_sig = nil
+      save_config()
+  end
+  if imgui.is_item_hovered() then
+      imgui.set_tooltip("While IsReticleFitting is true (focused aim, use the colors below instead of the main Dot and Beam pickers.")
+  end
+  if focused_laser_colors.enabled then
+      focused_laser_colors.dot = sanitize_color_array(focused_laser_colors.dot, {0.0, 1.0, 0.0, 1.0})
+      focused_laser_colors.beam = sanitize_color_array(focused_laser_colors.beam, {0.0, 1.0, 0.0, 1.0})
+      local rfm_changed, rfm_new = imgui.checkbox("Match focused dot & beam##match_focused_dot_beam", focused_laser_colors.match_focused_dot_beam)
+      if rfm_changed then
+          focused_laser_colors.match_focused_dot_beam = rfm_new
+          if focused_laser_colors.match_focused_dot_beam then
+            focused_laser_colors.beam = {
+              focused_laser_colors.dot[1], focused_laser_colors.dot[2], focused_laser_colors.dot[3],
+              focused_laser_colors.dot[4] or 1.0,
+            }
+          end
+          focused_laser_colors.runtime_beam_sig = nil
+          save_config()
+      end
+      if imgui.is_item_hovered() then
+          imgui.set_tooltip("While using focused-aim colors, the beam tint follows the focused dot color.")
+      end
+      imgui.set_next_item_width(280)
+      local sfg_changed, sfg_new = imgui.slider_float("Glow (focused)##reticle_fit_glow", focused_laser_colors.glow, 0.0, 100.0, "%.1f")
+      if imgui.is_item_hovered() then
+          imgui.set_tooltip("Laser dot glow (ColorPanel saturation) while focused (_IsReticleFitting).")
+      end
+      if sfg_changed then
+          focused_laser_colors.glow = math.max(0.0, math.min(100.0, sfg_new))
+          save_config()
+      end
+      local rfd = {
+        focused_laser_colors.dot[1] or 0.0,
+        focused_laser_colors.dot[2] or 1.0,
+        focused_laser_colors.dot[3] or 0.0
+      }
+      local rfd_changed, rfd_new
+      local rfd_ok = pcall(function()
+        rfd_changed, rfd_new = imgui.color_edit3("Dot (focused)##rf_dot_picker", rfd, 4194304 | 32)
+      end)
+      if not rfd_ok then
+        local rfd_4f = Vector4f.new(focused_laser_colors.dot[1], focused_laser_colors.dot[2], focused_laser_colors.dot[3], focused_laser_colors.dot[4] or 1.0)
+        rfd_changed, rfd_new = imgui.color_edit4("Dot (focused)##rf_dot_picker", rfd_4f, 4194304 | 32)
+        if rfd_new then
+          focused_laser_colors.dot = {rfd_new.x, rfd_new.y, rfd_new.z, rfd_new.w}
+        end
+      else
+        if rfd_new then
+          focused_laser_colors.dot = rfd_new
+        end
+      end
+      if imgui.is_item_hovered() then
+          imgui.set_tooltip("Laser dot color while focused (_IsReticleFitting true)")
+      end
+      if rfd_changed then
+          if focused_laser_colors.match_focused_dot_beam then
+            focused_laser_colors.beam = {
+              focused_laser_colors.dot[1], focused_laser_colors.dot[2], focused_laser_colors.dot[3],
+              focused_laser_colors.dot[4] or 1.0,
+            }
+          end
+          focused_laser_colors.runtime_beam_sig = nil
+          save_config()
+      end
+      if not focused_laser_colors.match_focused_dot_beam then
+          imgui.same_line()
+          local rfb = {
+            focused_laser_colors.beam[1] or 0.0,
+            focused_laser_colors.beam[2] or 1.0,
+            focused_laser_colors.beam[3] or 0.0
+          }
+          local rfb_changed, rfb_new
+          local rfb_ok = pcall(function()
+            rfb_changed, rfb_new = imgui.color_edit3("Beam (focused)##rf_beam_picker", rfb, 4194304 | 32)
+          end)
+          if not rfb_ok then
+            local rfb_4f = Vector4f.new(focused_laser_colors.beam[1], focused_laser_colors.beam[2], focused_laser_colors.beam[3], focused_laser_colors.beam[4] or 1.0)
+            rfb_changed, rfb_new = imgui.color_edit4("Beam (focused)##rf_beam_picker", rfb_4f, 4194304 | 32)
+            if rfb_new then
+              focused_laser_colors.beam = {rfb_new.x, rfb_new.y, rfb_new.z, rfb_new.w}
+            end
+          else
+            if rfb_new then
+              focused_laser_colors.beam = rfb_new
+            end
+          end
+          if imgui.is_item_hovered() then
+              imgui.set_tooltip("Laser beam color while focused (_IsReticleFitting true)")
+          end
+          if rfb_changed then
+              focused_laser_colors.runtime_beam_sig = nil
+              save_config()
+          end
+      end
   end
   
   imgui.end_rect(1)
@@ -3866,6 +4917,7 @@ re.on_draw_ui(function()
         save_config()
     end
   end
+  imgui.text_colored("Select crosshair type:", 0xFFFFFFAA)
   imgui.set_next_item_width(110)
   local dcvt_changed, dcvt_new = imgui.combo("##crosshair_viewtype", default_crosshair_view_type, CROSSHAIR_TYPE_COMBO_LABELS)
   if dcvt_changed then
@@ -3896,8 +4948,9 @@ re.on_draw_ui(function()
       save_config()
   end
   if imgui.is_item_hovered() then
-      imgui.set_tooltip("Always show in front")
+      imgui.set_tooltip("Always show  when unchecked")
   end
+  imgui.text_colored("Glow only applies when crosshair type is 3D Crosshair and Overlay is unchecked.", 0xFF888888)
   imgui.set_next_item_width(200)
   local dcs_changed, dcs_new = imgui.slider_float("Glow##crosshair_sat", default_crosshair_saturation, 0.0, 100.0, "%.1f")
   if dcs_changed then
@@ -3906,12 +4959,101 @@ re.on_draw_ui(function()
       save_config()
   end
   if imgui.is_item_hovered() then
-      imgui.set_tooltip("Glow/saturation of the crosshair when laser is off")
+      imgui.set_tooltip("Glow/saturation of the crosshair when laser is off. Only has an effect when crosshair type is 3D Crosshair (not Default) and Overlay is unchecked.")
+  end
+  if not crosshair_combo_shows_3d_crosshair() then
+    local chs_changed, chs_new = imgui.checkbox("Hide crosshair after shot (pistols only)##crosshair_hide_after_shot", post_shot.crosshair_after.enabled)
+    if chs_changed then
+        post_shot.crosshair_after.enabled = chs_new
+        if not chs_new then
+          post_shot.crosshair_after.weapon_id = nil
+          post_shot.crosshair_after.effect_until = 0.0
+        end
+        save_config()
+    end
+    if imgui.is_item_hovered() then
+      imgui.set_tooltip(
+        "Pistols only: SG-09 R, Punisher, Red9, Blacktail, Matilda, Minecart Handgun, Broken Butterfly, Killer7, Handcannon, Sentinel Nine, Blacktail AC, Punisher MC, Red9 SW, XM96E1.\n"
+        .. "After each shot, hide the crosshair for the duration below."
+      )
+    end
+    if post_shot.crosshair_after.enabled then
+      imgui.set_next_item_width(200)
+      local cht_changed, cht_new = imgui.drag_float("Duration (sec)##crosshair_hide_after_shot_timer", post_shot.crosshair_after.timer_sec, 0.01, 0.01, 3.0, "%.2f")
+      if cht_changed then
+        post_shot.crosshair_after.timer_sec = math.max(0.01, math.min(10.0, cht_new))
+        save_config()
+      end
+    end
   end
   imgui.end_rect(1)
   imgui.end_group()
   end
   
+  imgui.spacing()
+
+  imgui.begin_rect()
+  imgui.text_colored(" Laser Dot/Beam Presets:", 0xFFFFFFAA)
+  if imgui.button("Default Preset##default_dot_beam_preset") then
+    crosshair_saturation = LASER_DOT_GLOW_DEFAULT
+    _G.laser_mat_params = _G.laser_mat_params or {}
+    local function default_params_for_material(matName)
+      if not matName or matName == "" then return end
+      _G.laser_mat_params[matName] = {}
+      copy_laser_beam_material_defaults_into(_G.laser_mat_params[matName])
+    end
+    if laser_trail_gameobject then
+      local ok_mc, mesh_component = pcall(function()
+        return laser_trail_gameobject:call("getComponent(System.Type)", sdk.typeof("via.render.Mesh"))
+      end)
+      if ok_mc and mesh_component and mesh_component.get_MaterialNum then
+        for j = 0, mesh_component:get_MaterialNum() - 1 do
+          default_params_for_material(mesh_component:getMaterialName(j))
+        end
+        apply_laser_trail_settings()
+      else
+        default_params_for_material("wp4000_00_Laserbeam")
+      end
+    else
+      default_params_for_material("wp4000_00_Laserbeam")
+    end
+    save_config()
+  end
+  if imgui.is_item_hovered() then
+    imgui.set_tooltip("Restores laser dot Glow and all beam material sliders to the mod defaults (same as a fresh install for dot glow + beam MDF). Saves to config.")
+  end
+  imgui.same_line()
+  if imgui.button("Ultra Bright Preset##ultra_bright_preset") then
+    crosshair_saturation = 50.0
+    dot_scale = 1.25
+    _G.laser_mat_params = _G.laser_mat_params or {}
+    local function ultra_bright_params_for_material(matName)
+      if not matName or matName == "" then return end
+      if not _G.laser_mat_params[matName] then _G.laser_mat_params[matName] = {} end
+      _G.laser_mat_params[matName].AlphaRate = 0.5
+      _G.laser_mat_params[matName].SmokeContrast_Pow = 0.0
+    end
+    if laser_trail_gameobject then
+      local ok_mc, mesh_component = pcall(function()
+        return laser_trail_gameobject:call("getComponent(System.Type)", sdk.typeof("via.render.Mesh"))
+      end)
+      if ok_mc and mesh_component and mesh_component.get_MaterialNum then
+        for j = 0, mesh_component:get_MaterialNum() - 1 do
+          ultra_bright_params_for_material(mesh_component:getMaterialName(j))
+        end
+        apply_laser_trail_settings()
+      else
+        ultra_bright_params_for_material("wp4000_00_Laserbeam")
+      end
+    else
+      ultra_bright_params_for_material("wp4000_00_Laserbeam")
+    end
+    save_config()
+  end
+  if imgui.is_item_hovered() then
+    imgui.set_tooltip("Sets laser dot Glow to 50, Dot/Crosshair scale to 1.25, beam AlphaRate to 0.5, and SmokeContrast_Pow to 0.0 on each trail material (or wp4000_00_Laserbeam when trail is inactive). Saves to config.")
+  end
+  imgui.end_rect(1)
   imgui.spacing()
   
   -- Laser/Knife Dot Settings
@@ -3985,16 +5127,8 @@ re.on_draw_ui(function()
       
       -- Set hardcoded defaults for laser beam material parameters
       if not _G.laser_mat_params_defaults["wp4000_00_Laserbeam"] then
-        _G.laser_mat_params_defaults["wp4000_00_Laserbeam"] = {
-          AlphaRate = 0.009999999776482582,
-          EmissiveColor = {1.0, 0.0, 0.0, 1.0},
-          EmissiveIntensity = 100.0,
-          GradationRate = 1.2100000381469727,
-          SmokeContrast_Add = 0.0,
-          SmokeContrast_Pow = 5.0,
-          SmokeDetailScale = 7.679999828338623,
-          SmokeDetailSpeed = 4.769999980926514
-        }
+        _G.laser_mat_params_defaults["wp4000_00_Laserbeam"] = {}
+        copy_laser_beam_material_defaults_into(_G.laser_mat_params_defaults["wp4000_00_Laserbeam"])
       end
       
       for j = 0, matCount - 1 do
@@ -4132,9 +5266,9 @@ re.on_draw_ui(function()
   end
   local selected_id = tostring(weapon_ids[_G.selected_weapon_idx])
   local offset = laser_origin_offsets[selected_id] or {x=0, y=0, z=0}
-  local changed_x, new_x = imgui.slider_float("X Offset", offset.x, -1, 1, "%.4f")
-  local changed_y, new_y = imgui.slider_float("Y Offset", offset.y, -1, 1, "%.4f")
-  local changed_z, new_z = imgui.slider_float("Z Offset", offset.z, -1, 1, "%.4f")
+  local changed_x, new_x = imgui.drag_float("X Offset##laser_origin_x", offset.x, 0.0005, -1, 1, "%.4f")
+  local changed_y, new_y = imgui.drag_float("Y Offset##laser_origin_y", offset.y, 0.0005, -1, 1, "%.4f")
+  local changed_z, new_z = imgui.drag_float("Z Offset##laser_origin_z", offset.z, 0.0005, -1, 1, "%.4f")
   if changed_x or changed_y or changed_z then
       laser_origin_offsets[selected_id] = {x=new_x, y=new_y, z=new_z}
       save_config()
@@ -4150,7 +5284,7 @@ re.on_draw_ui(function()
       min_scale = 0.3
       dot_scale = 1.0
       knife_dot_scale = 1.0
-      crosshair_saturation = 20.0
+      crosshair_saturation = LASER_DOT_GLOW_DEFAULT
       static_center_dot = false
       update_spawn_flag()
       simple_static_mode = false
@@ -4164,6 +5298,10 @@ re.on_draw_ui(function()
       default_crosshair_overlay = true
       default_crosshair_detonemap = true
       default_crosshair_depth_test = false
+      post_shot.crosshair_after.enabled = false
+      post_shot.crosshair_after.timer_sec = 0.25
+      post_shot.crosshair_after.effect_until = 0.0
+      post_shot.crosshair_after.weapon_id = nil
       laser_dot_color_array = {1.0, 0.0, 0.0, 1.0}
       knife_dot_color_array = {1.0, 1.0, 1.0, 1.0}
       laser_color_array = laser_dot_color_array
@@ -4179,16 +5317,8 @@ re.on_draw_ui(function()
     
     -- Set hardcoded defaults for laser beam material parameters
     if not _G.laser_mat_params_defaults then _G.laser_mat_params_defaults = {} end
-    _G.laser_mat_params_defaults["wp4000_00_Laserbeam"] = {
-      AlphaRate = 0.009999999776482582,
-      EmissiveColor = {1.0, 0.0, 0.0, 1.0},
-      EmissiveIntensity = 100.0,
-      GradationRate = 1.2100000381469727,
-      SmokeContrast_Add = 0.0,
-      SmokeContrast_Pow = 5.0,
-      SmokeDetailScale = 7.679999828338623,
-      SmokeDetailSpeed = 4.769999980926514
-    }
+    _G.laser_mat_params_defaults["wp4000_00_Laserbeam"] = {}
+    copy_laser_beam_material_defaults_into(_G.laser_mat_params_defaults["wp4000_00_Laserbeam"])
     
     if laser_trail_gameobject then
       local mesh_component = laser_trail_gameobject:call("getComponent(System.Type)", sdk.typeof("via.render.Mesh"))
@@ -4230,6 +5360,12 @@ re.on_draw_ui(function()
       dot_scale = 1.0
       knife_dot_scale = 1.0
       disable_shoulder_corrector = false
+      perfect_accuracy_only_when_laser_active = false
+      perfect_focus_only_when_laser_active = false
+      classic_laser_trail_effective_prev = nil
+      _G.classic_re4_laser_perfect_accuracy_enabled = true
+      _G.classic_re4_laser_point_range_enabled = true
+      force_spread_update = true
       hide_dot_when_no_muzzle = false
       show_default_crosshair_laser_off = true
       default_crosshair_color_array = {1.0, 1.0, 1.0, 1.0}
@@ -4239,17 +5375,40 @@ re.on_draw_ui(function()
       default_crosshair_overlay = true
       default_crosshair_detonemap = true
       default_crosshair_depth_test = false
+      post_shot.crosshair_after.enabled = false
+      post_shot.crosshair_after.timer_sec = 0.25
+      post_shot.crosshair_after.effect_until = 0.0
+      post_shot.crosshair_after.weapon_id = nil
       laser_beam_color_array = {1.0, 0.0, 0.0, 1.0}
       laser_dot_color_array = {1.0, 0.0, 0.0, 1.0}
       knife_dot_color_array = {1.0, 1.0, 1.0, 1.0}
       laser_color_array = {1.0, 0.0, 0.0, 1.0}
-      crosshair_saturation = 20.0
+      focused_laser_colors.enabled = false
+      focused_laser_colors.dot = {0.0, 1.0, 0.0, 1.0}
+      focused_laser_colors.beam = {0.0, 1.0, 0.0, 1.0}
+      focused_laser_colors.runtime_beam_sig = nil
+      focused_laser_colors.match_focused_dot_beam = false
+      focused_laser_colors.glow = LASER_DOT_GLOW_DEFAULT
+      post_shot.match_main_dot_beam = false
+      crosshair_saturation = LASER_DOT_GLOW_DEFAULT
       static_center_dot = false
       update_spawn_flag()
       static_lerp_speed = 50.0
       simple_static_mode = false
       enable_laser_trail = true
       laser_trail_scale = 1.5
+      post_shot.hide_laser = false
+      post_shot.timer_sec = 0.2
+      post_shot.restrict_list = false
+      post_shot.weapon_ids = {}
+      post_shot.dim_enabled = false
+      post_shot.dim_restrict_list = false
+      post_shot.dim_weapon_ids = {}
+      post_shot.dim_dot_scale = 0.95
+      post_shot.dim_glow_saturation = 1.0
+      post_shot.dim_intensity_dim = 1.0
+      post_shot.firing_mode = nil
+      post_shot.per_weapon = {}
       hide_dot_when_no_muzzle = false
       show_default_crosshair_laser_off = true
       default_crosshair_color_array = {1.0, 1.0, 1.0, 1.0}
